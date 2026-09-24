@@ -186,10 +186,14 @@ menu_read() {
 
     local sel="${MENU_LAST[${__id}]:-0}"
     (( sel >= cnt )) && sel=0
-    local typed="" key seq result=""
+    local typed="" key seq result="" redraw=1
 
     printf '\033[?25l' > /dev/tty
     while true; do
+      # Экран перерисовывается ТОЛЬКО после стрелок (и при входе в меню). Пока ты
+      # набираешь номер, меняется одна строка ввода: иначе подсветка прыгала бы
+      # на пункт «1» раньше, чем успеешь набрать «12».
+      if (( redraw )); then
         # --- Отрисовка: окно по высоте терминала, выбранный пункт всегда виден ---
         local rows=24 cols=80 sz
         sz="$(stty size < /dev/tty 2>/dev/null || true)"
@@ -241,9 +245,11 @@ menu_read() {
                 out+="${L[$i]}"$'\033[0m\n'
             fi
         done
-        out+=$'\033[2m'"↑↓ выбор · Enter — выполнить · цифра или буква — сразу к пункту · q/Esc — назад"$'\033[0m\n'
+        out+=$'\033[2m'"↑↓ выбор · Enter — выполнить · или введи номер целиком (двузначный — обе цифры) · q/Esc — назад"$'\033[0m\n'
         out+="${__prompt}${typed:-${IK[$sel]}}"
         printf '%s' "${out}" > /dev/tty
+        redraw=0
+      fi
 
         # --- Клавиши ---
         IFS= read -rsn1 key < /dev/tty || { result="0"; break; }
@@ -251,12 +257,12 @@ menu_read() {
             seq=""
             IFS= read -rsn2 -t 0.05 seq < /dev/tty || true
             case "${seq}" in
-                '[A'|'OA'|'[D'|'OD') sel=$(( (sel - 1 + cnt) % cnt )); typed="" ;;
-                '[B'|'OB'|'[C'|'OC') sel=$(( (sel + 1) % cnt )); typed="" ;;
-                '[H'|'OH')           sel=0; typed="" ;;
-                '[F'|'OF')           sel=$(( cnt - 1 )); typed="" ;;
+                '[A'|'OA'|'[D'|'OD') sel=$(( (sel - 1 + cnt) % cnt )); typed=""; redraw=1 ;;
+                '[B'|'OB'|'[C'|'OC') sel=$(( (sel + 1) % cnt )); typed=""; redraw=1 ;;
+                '[H'|'OH')           sel=0; typed=""; redraw=1 ;;
+                '[F'|'OF')           sel=$(( cnt - 1 )); typed=""; redraw=1 ;;
                 '[5'|'[6')           IFS= read -rsn1 -t 0.05 _ < /dev/tty || true
-                                     if [[ "${seq}" == '[5' ]]; then sel=0; else sel=$(( cnt - 1 )); fi; typed="" ;;
+                                     if [[ "${seq}" == '[5' ]]; then sel=0; else sel=$(( cnt - 1 )); fi; typed=""; redraw=1 ;;
                 '')                  result="${seen[0]:+0}"; result="${result:-q}"; break ;;
                 *)                   ;;
             esac
@@ -280,12 +286,13 @@ menu_read() {
                     [[ "${IK[$i]}" == "${typed}" ]] && exact="${i}"
                     [[ "${IK[$i]}" != "${typed}" && "${IK[$i]}" == "${typed}"* ]] && longer=1
                 done
-                if (( exact >= 0 )); then
-                    sel="${exact}"
-                    # Однозначное совпадение — выполняем сразу, как нажатие кнопки
-                    if (( longer == 0 )); then result="${typed}"; break; fi
-                fi ;;
+                # Номер однозначный (продолжения нет) — выполняем сразу. Если он может
+                # быть началом другого (1 → 10..14), ждём следующий символ или Enter.
+                if (( exact >= 0 && longer == 0 )); then result="${typed}"; break; fi ;;
         esac
+        # Набор текста: обновляем только строку ввода, экран не трогаем
+        if [[ -n "${typed}" ]]; then printf '\033[?25h' > /dev/tty; else printf '\033[?25l' > /dev/tty; fi
+        printf '\r\033[K%s%s' "${__prompt}" "${typed:-${IK[$sel]}}" > /dev/tty
     done
 
     MENU_LAST[${__id}]="${sel}"
