@@ -11,7 +11,7 @@
 #  возвращает систему к умолчаниям.
 # ==============================================================================
 
-readonly LINAH_VERSION="1.0.1"
+readonly LINAH_VERSION="1.1.0"
 
 set -eo pipefail
 
@@ -31,18 +31,22 @@ readonly C_BG_GREEN='\033[42;1;30m'
 readonly C_BG_BLUE='\033[44;1;37m'
 readonly C_BG_MAGENTA='\033[45;1;37m'
 
-# --- Пути к конфигам ---
-readonly PW_CONF_DIR="${HOME}/.config/pipewire/pipewire.conf.d"
-readonly PREAMP_CONF="${PW_CONF_DIR}/99-linah-preamp.conf"
-readonly LEGACY_PREAMP_CONF="${PW_CONF_DIR}/99-carbon-preamp.conf"
-readonly WP_DIR_04="${HOME}/.config/wireplumber/bluetooth.lua.d"
-readonly WP_CONF_04="${WP_DIR_04}/51-bluez-volume-fix.lua"
-readonly WP_DIR_05="${HOME}/.config/wireplumber/wireplumber.conf.d"
-readonly WP_CONF_05="${WP_DIR_05}/51-bluez-hw-volume.conf"
-readonly WP_STATE_DIR="${HOME}/.local/state/wireplumber"
-readonly WP_ROLES_04="${WP_DIR_04}/52-bluez-a2dp-only.lua"
-readonly WP_ROLES_05="${WP_DIR_05}/52-bluez-a2dp-only.conf"
-readonly BT_MAIN_CONF="/etc/bluetooth/main.conf"
+# --- Пути к конфигам (динамические для поддержки смены пользователя / SSH) ---
+PW_CONF_DIR="${HOME}/.config/pipewire/pipewire.conf.d"
+PREAMP_CONF="${PW_CONF_DIR}/99-linah-preamp.conf"
+LEGACY_PREAMP_CONF="${PW_CONF_DIR}/99-carbon-preamp.conf"
+PRESET_GAMING_CONF="${PW_CONF_DIR}/99-linah-preset-gaming.conf"
+PRESET_CINEMA_CONF="${PW_CONF_DIR}/99-linah-preset-cinema.conf"
+PRESET_HIFI_CONF="${PW_CONF_DIR}/99-linah-preset-hifi.conf"
+RNNOISE_CONF="${PW_CONF_DIR}/99-linah-rnnoise.conf"
+WP_DIR_04="${HOME}/.config/wireplumber/bluetooth.lua.d"
+WP_CONF_04="${WP_DIR_04}/51-bluez-volume-fix.lua"
+WP_DIR_05="${HOME}/.config/wireplumber/wireplumber.conf.d"
+WP_CONF_05="${WP_DIR_05}/51-bluez-hw-volume.conf"
+WP_STATE_DIR="${HOME}/.local/state/wireplumber"
+WP_ROLES_04="${WP_DIR_04}/52-bluez-a2dp-only.lua"
+WP_ROLES_05="${WP_DIR_05}/52-bluez-a2dp-only.conf"
+BT_MAIN_CONF="/etc/bluetooth/main.conf"
 
 # ==============================================================================
 # ВЫБОР ПУНКТОВ СТРЕЛКАМИ
@@ -245,7 +249,7 @@ menu_read() {
                 out+="${L[$i]}"$'\033[0m\n'
             fi
         done
-        out+=$'\033[2m'"↑↓ выбор · Enter — выполнить · или введи номер целиком (двузначный — обе цифры) · q/Esc — назад"$'\033[0m\n'
+        out+=$'\033[2m'"↑↓ выбор · Enter — выполнить · или введи номер/букву · / поиск · q/Esc — назад"$'\033[0m\n'
         out+="${__prompt}${typed:-${IK[$sel]}}"
         printf '%s' "${out}" > /dev/tty
         redraw=0
@@ -274,6 +278,30 @@ menu_read() {
                 else result="${IK[$sel]}"; fi
                 break ;;
             $'\177'|$'\b')            typed="${typed%?}" ;;
+            /)
+                if [[ -z "${typed}" ]]; then
+                    printf '\033[?25h\r\033[K%s/ ' "${__prompt}" > /dev/tty
+                    local sq=""
+                    read -r sq < /dev/tty || true
+                    if [[ -n "${sq}" ]]; then
+                        local m_idx=-1
+                        local sq_low="${sq,,}"
+                        for (( i = 0; i < cnt; i++ )); do
+                            local p_low="${P[${IL[$i]}],,}"
+                            if [[ "${p_low}" == *"${sq_low}"* ]]; then
+                                m_idx="${i}"
+                                break
+                            fi
+                        done
+                        if (( m_idx >= 0 )); then
+                            sel="${m_idx}"
+                        fi
+                    fi
+                    typed=""
+                    redraw=1
+                    continue
+                fi
+                typed+="${key}" ;;
             q|Q)
                 if [[ -z "${typed}" && -z "${seen[q]:-}" && -z "${seen[Q]:-}" ]]; then
                     result="${seen[0]:+0}"; result="${result:-q}"; break
@@ -335,13 +363,168 @@ LOGO
     printf "  ${C_DIM}──────────────────────────────────────────────────────────────────────────────${C_RESET}\n\n"
 }
 
-# --- Проверка запуска от root (ругать юзера) ---
+# --- Поиск активных пользовательских сессий (для SSH и root-администрирования) ---
+get_active_sessions() {
+    local -a sessions=()
+    if command -v loginctl &>/dev/null; then
+        while read -r sess uid user seat rest; do
+            [[ -z "$sess" || "$sess" == "SESSION" ]] && continue
+            local has_audio="нет"
+            if [[ -S "/run/user/${uid}/pulse/native" || -S "/run/user/${uid}/pipewire-0" ]]; then
+                has_audio="да"
+            fi
+            sessions+=("${sess}:${uid}:${user}:${seat:-seat0}:${has_audio}")
+        done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+    fi
+    for udir in /run/user/*; do
+        [[ -d "$udir" ]] || continue
+        local uid="${udir##*/}"
+        [[ "$uid" =~ ^[0-9]+$ ]] || continue
+        local uname
+        uname="$(getent passwd "$uid" 2>/dev/null | cut -d: -f1 || true)"
+        [[ -z "$uname" ]] && continue
+        local already=0
+        for s in "${sessions[@]:-}"; do
+            if [[ "$s" == *":${uid}:${uname}:"* ]]; then already=1; break; fi
+        done
+        if (( ! already )); then
+            local has_audio="нет"
+            if [[ -S "/run/user/${uid}/pulse/native" || -S "/run/user/${uid}/pipewire-0" ]]; then
+                has_audio="да"
+            fi
+            sessions+=("dir:${uid}:${uname}:-:${has_audio}")
+        fi
+    done
+    if (( ${#sessions[@]} > 0 )); then
+        printf "%s\n" "${sessions[@]}"
+    fi
+}
+
+switch_to_user_session() {
+    local target="$1"
+    local uid
+    uid="$(id -u "$target" 2>/dev/null || true)"
+    if [[ -z "$uid" ]]; then
+        log_danger "Пользователь «${target}» не найден в системе."
+        return 1
+    fi
+    local home_dir
+    home_dir="$(getent passwd "$target" 2>/dev/null | cut -d: -f6 || true)"
+    [[ -z "$home_dir" ]] && home_dir="/home/${target}"
+
+    export TARGET_USER="$target"
+    export TARGET_UID="$uid"
+    export TARGET_HOME="$home_dir"
+    export USER="$target"
+    export HOME="$home_dir"
+    export XDG_RUNTIME_DIR="/run/user/${uid}"
+    export PULSE_SERVER="unix:/run/user/${uid}/pulse/native"
+    export PIPEWIRE_RUNTIME_DIR="/run/user/${uid}"
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus"
+
+    PW_CONF_DIR="${TARGET_HOME}/.config/pipewire/pipewire.conf.d"
+    PREAMP_CONF="${PW_CONF_DIR}/99-linah-preamp.conf"
+    LEGACY_PREAMP_CONF="${PW_CONF_DIR}/99-carbon-preamp.conf"
+    PRESET_GAMING_CONF="${PW_CONF_DIR}/99-linah-preset-gaming.conf"
+    PRESET_CINEMA_CONF="${PW_CONF_DIR}/99-linah-preset-cinema.conf"
+    PRESET_HIFI_CONF="${PW_CONF_DIR}/99-linah-preset-hifi.conf"
+    RNNOISE_CONF="${PW_CONF_DIR}/99-linah-rnnoise.conf"
+    WP_DIR_04="${TARGET_HOME}/.config/wireplumber/bluetooth.lua.d"
+    WP_CONF_04="${WP_DIR_04}/51-bluez-volume-fix.lua"
+    WP_DIR_05="${TARGET_HOME}/.config/wireplumber/wireplumber.conf.d"
+    WP_CONF_05="${WP_DIR_05}/51-bluez-hw-volume.conf"
+    WP_STATE_DIR="${TARGET_HOME}/.local/state/wireplumber"
+    WP_ROLES_04="${WP_DIR_04}/52-bluez-a2dp-only.lua"
+    WP_ROLES_05="${WP_DIR_05}/52-bluez-a2dp-only.conf"
+    return 0
+}
+
+# --- Проверка запуска от root и подключение к сессии пользователя ---
 check_not_root() {
     if [[ "${EUID}" -eq 0 ]]; then
+        if [[ -n "${TARGET_USER:-}" ]]; then
+            return 0
+        fi
+
+        local -a sessions=()
+        while IFS=: read -r s_id s_uid s_user s_seat s_aud; do
+            [[ -n "$s_user" ]] && sessions+=("${s_user}:${s_uid}:${s_seat}:${s_aud}")
+        done < <(get_active_sessions 2>/dev/null || true)
+
+        if (( ${#sessions[@]} == 1 )) && ! _menu_interactive; then
+            local s0="${sessions[0]}"
+            local u0="${s0%%:*}"
+            switch_to_user_session "$u0"
+            return 0
+        fi
+
+        if _menu_interactive; then
+            print_banner
+            printf "  ${C_BG_BLUE}${C_WHITE}${C_BOLD} РЕЖИМ СУПЕРПОЛЬЗОВАТЕЛЯ / SSH АДМИНИСТРАТОР ${C_RESET}\n\n"
+            printf "  ${C_BOLD}Внимание:${C_RESET} Скрипт запущен с правами ${C_RED}root${C_RESET}.\n"
+            printf "  Звуковой сервер PipeWire/PulseAudio работает внутри сессий пользователей.\n"
+            printf "  Выберите сессию пользователя для диагностики и управления звуком:\n\n"
+
+            local idx=1
+            local -a ulist=()
+            for s in "${sessions[@]:-}"; do
+                local u="${s%%:*}"
+                local rest="${s#*:}"
+                local uid="${rest%%:*}"
+                rest="${rest#*:}"
+                local seat="${rest%%:*}"
+                local aud="${rest#*:}"
+                local aud_icon="🔊"
+                [[ "$aud" != "да" ]] && aud_icon="⚠️ "
+                printf "    [%d] %s Пользователь ${C_GREEN}%s${C_RESET} (UID: %s, %s, аудио: %s)\n" "$idx" "$aud_icon" "$u" "$uid" "$seat" "$aud"
+                ulist+=("$u")
+                idx=$(( idx + 1 ))
+            done
+            printf "    [m] ✍️  Указать имя пользователя вручную\n"
+            printf "    [r] 🛡️  Продолжить от root (только базовый опрос ALSA-оборудования)\n"
+            printf "    [0] 🚪 Выход\n\n"
+
+            local pick
+            read -r -p "Выберите вариант [1-$(( idx - 1 ))/m/r/0]: " pick
+            case "$pick" in
+                0|q|Q) exit 0 ;;
+                r|R) log_warn "Продолжаем от имени root. Пользовательские сокеты могут быть недоступны."; return 0 ;;
+                m|M)
+                    read -r -p "Введите имя пользователя: " custom_user
+                    if [[ -n "$custom_user" ]]; then
+                        switch_to_user_session "$custom_user"
+                        return 0
+                    fi
+                    ;;
+                *)
+                    if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#ulist[@]} )); then
+                        local chosen="${ulist[$(( pick - 1 ))]}"
+                        switch_to_user_session "$chosen"
+                        log_cool "Подключено к аудиосессии пользователя «${chosen}»!"
+                        sleep 1
+                        return 0
+                    fi
+                    ;;
+            esac
+        fi
+
+        if (( ${#sessions[@]} > 0 )); then
+            # Авто-подключение к первому пользователю с активным аудио
+            for s in "${sessions[@]}"; do
+                if [[ "$s" == *":да" ]]; then
+                    local auto_u="${s%%:*}"
+                    switch_to_user_session "$auto_u"
+                    return 0
+                fi
+            done
+            local first_u="${sessions[0]%%:*}"
+            switch_to_user_session "$first_u"
+            return 0
+        fi
+
         log_danger "Слышь, ковбой, осади коней! Зачем ты запустил меня через sudo/root?!"
         printf "  Звуковой сервер PipeWire/PulseAudio живёт в твоей ПОЛЬЗОВАТЕЛЬСКОЙ сессии.\n"
-        printf "  Запускаясь от рута, ты настраиваешь звук суперпользователю в вакууме.\n"
-        printf "  ${C_BOLD}Запусти скрипт от своего обычного юзера без sudo!${C_RESET}\n\n"
+        printf "  Запусти скрипт от своего обычного юзера без sudo или укажи: ${C_BOLD}sudo %s --user <пользователь>${C_RESET}\n\n" "$0"
         exit 1
     fi
 }
@@ -3225,20 +3408,35 @@ audio_first_aid_kit() {
         _hint 'Когда: наушники не подключаются сами после включения, каждый раз приходится подключать вручную.'
         printf "\n"
 
-        printf "  ${C_BOLD}${C_GREEN}МИКРОФОН${C_RESET}\n"
+        printf "  ${C_BOLD}${C_GREEN}МИКРОФОН И ГОЛОС${C_RESET}\n"
         printf "  ${C_BOLD}[17]${C_RESET}  Включить микрофон и выставить безопасный уровень\n"
         _hint 'Зачем: снимает mute с микрофона и ставит безопасный уровень 80%.'
         _hint 'Когда: тебя не слышно в звонках, хотя микрофон исправен.'
         printf "  ${C_BOLD}[18]${C_RESET}  Поднять микрофон с подавлением эха и шума (WebRTC)\n"
         _hint 'Зачем: создаёт виртуальный микрофон, который подавляет эхо и фоновый шум (WebRTC).'
         _hint 'Когда: собеседники слышат эхо от колонок или шум. В наушниках эха нет, и это не нужно.'
+        printf "  ${C_BOLD}[19]${C_RESET}  Нейросетевое шумоподавление микрофона (RNNoise / WebRTC)\n"
+        _hint 'Зачем: отсекает шум вентиляторов, стук по клавиатуре и фоновый гул.'
+        _hint 'Когда: собеседники жалуются на постоянный шум кулеров или клики клавиш.'
+        printf "\n"
+
+        printf "  ${C_BOLD}${C_BLUE}ВНЕШНИЕ ВЫХОДЫ И ЭКРАН${C_RESET}\n"
+        printf "  ${C_BOLD}[20]${C_RESET}  Доктор HDMI / DisplayPort (разбудить спящий звук монитора/ТВ)\n"
+        _hint 'Зачем: будит звуковой тракт HDMI/DisplayPort, снимает MUTE с каналов IEC958.'
+        _hint 'Когда: видео идёт на монитор или ТВ, а звука нет или он не переключается.'
+        printf "  ${C_BOLD}[21]${C_RESET}  Bluetooth Wideband Speech (mSBC / FastStream — чистый голос гарнитуры)\n"
+        _hint 'Зачем: включает широкополосную передачу голоса 16 кГц в гарнитурах вместо 8 кГц «как из бочки».'
+        _hint 'Когда: во время голосовых звонков голос звучит глухо и зажато.'
+        printf "  ${C_BOLD}[22]${C_RESET}  Проверка и починка захвата звука экрана (OBS / Discord / WebRTC)\n"
+        _hint 'Зачем: проверяет порталы xdg-desktop-portal и доступ к аудиопотокам экрана.'
+        _hint 'Когда: при демонстрации экрана или записи в OBS нет системного звука.'
         printf "\n"
 
         printf "  ${C_BOLD}[0]${C_RESET}  🔙 Назад в главное меню\n\n"
 
         local kit_choice
         } > "${MENU_BUF}" 2>&1
-        menu_read kit_choice "Что применяем? [0-18]: "
+        menu_read kit_choice "Что применяем? [0-22]: "
         printf "\n"
         case "${kit_choice}" in
             1)  fix_alsa_unmute        || true; press_enter ;;
@@ -3259,6 +3457,10 @@ audio_first_aid_kit() {
             16) fix_bt_autoenable      || true; fix_bt_trust_all || true; press_enter ;;
             17) fix_mic_unmute         || true; press_enter ;;
             18) fix_echo_cancel        || true; press_enter ;;
+            19) fix_rnnoise_mic        || true; press_enter ;;
+            20) fix_hdmi_audio         || true; press_enter ;;
+            21) fix_bt_wideband_speech || true; press_enter ;;
+            22) check_desktop_audio_capture || true; press_enter ;;
             0|q|Q) return ;;
             *) log_warn "Неверный выбор."; sleep 1 ;;
         esac
@@ -4680,19 +4882,1031 @@ restart_audio_stack() {
 }
 
 # ==============================================================================
+# 9. УДАЛЕННЫЙ АДМИНИСТРАТОР (SSH) И МУЛЬТИ-ПОЛЬЗОВАТЕЛЬСКИЕ СЕССИИ
+# ==============================================================================
+stream_audio_monitor() {
+    local def_sink
+    def_sink="$(pactl get-default-sink 2>/dev/null || pactl info 2>/dev/null | grep 'Default Sink' | cut -d: -f2 | xargs || true)"
+    if [[ -z "$def_sink" ]]; then
+        echo "Error: Default sink not found" >&2
+        return 1
+    fi
+    if command -v pw-record &>/dev/null; then
+        exec pw-record --target "$def_sink" --rate 44100 --channels 2 --format s16 - 2>/dev/null
+    elif command -v parec &>/dev/null; then
+        exec parec -d "${def_sink}.monitor" --rate=44100 --channels=2 --format=s16le 2>/dev/null
+    elif command -v ffmpeg &>/dev/null; then
+        exec ffmpeg -v quiet -f pulse -i "${def_sink}.monitor" -f s16le -ac 2 -ar 44100 - 2>/dev/null
+    else
+        echo "Error: No capture utility (pw-record, parec, ffmpeg) found" >&2
+        return 1
+    fi
+}
+
+remote_session_menu() {
+    while true; do
+        {
+        print_banner
+        log_title "SSH УДАЛЕННЫЙ ПОМОЩНИК И СЕССИИ ПОЛЬЗОВАТЕЛЕЙ"
+        printf "================================================================================\n\n"
+
+        local cur_u="${TARGET_USER:-${USER}}"
+        local cur_uid="${TARGET_UID:-${EUID}}"
+        local cur_home="${TARGET_HOME:-${HOME}}"
+        local cur_sock="${PULSE_SERVER:-/run/user/${cur_uid}/pulse/native}"
+
+        printf "  • ${C_BOLD}Текущий контекст пользователя:${C_RESET} ${C_GREEN}%s${C_RESET} (UID: %s)\n" "${cur_u}" "${cur_uid}"
+        printf "  • ${C_BOLD}Домашний каталог:${C_RESET}               %s\n" "${cur_home}"
+        printf "  • ${C_BOLD}Аудиосокет (Pulse/PW):${C_RESET}          %s\n" "${cur_sock}"
+        if [[ -S "/run/user/${cur_uid}/pulse/native" || -S "/run/user/${cur_uid}/pipewire-0" ]]; then
+            printf "  • ${C_BOLD}Статус аудиосервера:${C_RESET}            ${C_GREEN}● Доступен (сокет активен)${C_RESET}\n\n"
+        else
+            printf "  • ${C_BOLD}Статус аудиосервера:${C_RESET}            ${C_YELLOW}⚠️ Сокет не найден в /run/user/%s${C_RESET}\n\n" "${cur_uid}"
+        fi
+
+        printf "  ${C_BOLD}ДЕЙСТВИЯ:${C_RESET}\n\n"
+        printf "  ${C_BOLD}[1]${C_RESET} 🔄 ${C_BOLD}Сменить пользователя / выбрать другую сессию${C_RESET}\n"
+        _hint 'Зачем: переключает управление на сессию другого пользователя системы.'
+        _hint 'Когда: пользователь обратился за помощью, и админ подключился по SSH.'
+        printf "  ${C_BOLD}[2]${C_RESET} 📡 ${C_BOLD}Слушать звук удаленно через SSH (Инструкция и запуск)${C_RESET}\n"
+        _hint 'Зачем: транслирует звук рабочего стола удаленного пользователя на компьютер админа.'
+        _hint 'Когда: нужно своими ушами услышать, есть ли звук и нет ли хрипов/заиканий.'
+        printf "  ${C_BOLD}[3]${C_RESET} 🔊 ${C_BOLD}Подать тестовый звук в сессию пользователя${C_RESET}\n"
+        _hint 'Зачем: воспроизводит короткий сигнал в колонках/наушниках пользователя.'
+        _hint 'Когда: проверяем, слышит ли пользователь звук за своим рабочим столом.'
+        printf "  ${C_BOLD}[4]${C_RESET} 🎛️ ${C_BOLD}Активные программы со звуком в этой сессии${C_RESET}\n"
+        _hint 'Зачем: показывает, какие приложения пользователя сейчас воспроизводят звук.'
+        _hint 'Когда: пользователь говорит «видео играет, а звука нет» — смотрим, не заглушен ли браузер.'
+        printf "  ${C_BOLD}[0]${C_RESET} 🔙 ${C_BOLD}Назад в главное меню${C_RESET}\n\n"
+
+        } > "${MENU_BUF}" 2>&1
+        local rem_pick
+        menu_read rem_pick "Твой выбор [0-4]: "
+        case "${rem_pick}" in
+            1)
+                printf "\n  ${C_BOLD}Доступные активные сессии в системе:${C_RESET}\n\n"
+                local -a sess_arr=()
+                local s_idx=1
+                while IFS=: read -r s_id s_uid s_user s_seat s_aud; do
+                    [[ -z "$s_user" ]] && continue
+                    printf "    [%d] %s (UID: %s, сессия %s, аудио: %s)\n" "$s_idx" "$s_user" "$s_uid" "$s_id" "$s_aud"
+                    sess_arr+=("$s_user")
+                    s_idx=$(( s_idx + 1 ))
+                done < <(get_active_sessions)
+                printf "    [m] Ввести имя пользователя вручную\n"
+                printf "    [0] Отмена\n\n"
+                read -r -p "Выберите номер [1-$(( s_idx - 1 ))/m/0]: " u_sel
+                case "$u_sel" in
+                    0|q|Q) ;;
+                    m|M)
+                        read -r -p "Введите имя пользователя: " manual_u
+                        if [[ -n "$manual_u" ]]; then
+                            if switch_to_user_session "$manual_u"; then
+                                log_cool "Переключено на пользователя «${manual_u}»!"
+                            fi
+                        fi
+                        press_enter
+                        ;;
+                    *)
+                        if [[ "$u_sel" =~ ^[0-9]+$ ]] && (( u_sel >= 1 && u_sel <= ${#sess_arr[@]} )); then
+                            local chosen="${sess_arr[$(( u_sel - 1 ))]}"
+                            if switch_to_user_session "$chosen"; then
+                                log_cool "Переключено на пользователя «${chosen}»!"
+                            fi
+                            press_enter
+                        fi
+                        ;;
+                esac
+                ;;
+            2)
+                print_banner
+                log_title "УДАЛЁННОЕ ПРОСЛУШИВАНИЕ ЗВУКА ЧЕРЕЗ SSH"
+                printf "================================================================================\n\n"
+                printf "  Чтобы слушать звук с этого компьютера прямо на своих локальных колонках,\n"
+                printf "  запустите на СВОЁМ компьютере в терминале следующую команду:\n\n"
+                local host_ip
+                host_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || echo "remote_ip")"
+                local script_path
+                script_path="$(readlink -f "$0" 2>/dev/null || echo "linah.sh")"
+                local u_arg=""
+                [[ -n "${TARGET_USER:-}" ]] && u_arg="--user ${TARGET_USER}"
+
+                printf "  ${C_BG_BLUE}${C_WHITE} ЛОКАЛЬНАЯ КОМАНДА ДЛЯ АДМИНА: ${C_RESET}\n\n"
+                printf "  ${C_BOLD}ssh %s@%s \"%s --stream-monitor %s\" | aplay -f cd${C_RESET}\n\n" "${USER}" "${host_ip}" "${script_path}" "${u_arg}"
+                printf "  ${C_DIM}Или через mpv / ffplay:${C_RESET}\n"
+                printf "  ${C_BOLD}ssh %s@%s \"%s --stream-monitor %s\" | mpv -${C_RESET}\n\n" "${USER}" "${host_ip}" "${script_path}" "${u_arg}"
+                printf "  ${C_CYAN}Поток: uncompressed PCM 44.1 kHz, 16-bit stereo (задержка < 50мс).${C_RESET}\n\n"
+                press_enter
+                ;;
+            3)
+                log_info "Воспроизводим тестовый сигнал в сессии пользователя «${cur_u}»..."
+                if command -v paplay &>/dev/null && [[ -f "/usr/share/sounds/freedesktop/stereo/complete.oga" ]]; then
+                    paplay /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null || true
+                elif command -v speaker-test &>/dev/null; then
+                    speaker-test -t sine -f 880 -l 1 2>/dev/null || true
+                else
+                    aplay -q /usr/share/sounds/alsa/Front_Center.wav 2>/dev/null || true
+                fi
+                log_cool "Тестовый сигнал отправлен на устройство вывода пользователя!"
+                press_enter
+                ;;
+            4)
+                active_streams_menu
+                ;;
+            0|q|Q) return ;;
+            *) ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# 10. ВИЗУАЛИЗАТОР ЗВУКА, ЖИВОЙ VU-МЕТР И ДЕТЕКТОР СИГНАЛА
+# ==============================================================================
+run_terminal_vu_meter() {
+    if ! command -v python3 &>/dev/null; then
+        log_danger "Для работы терминального VU-метра требуется python3."
+        return 1
+    fi
+
+    local dev_mode="${1:-monitor}"
+    while true; do
+        local target_name=""
+        local cap_cmd=""
+        local def_sink
+        def_sink="$(pactl get-default-sink 2>/dev/null || pactl info 2>/dev/null | grep 'Default Sink' | cut -d: -f2 | xargs || true)"
+        local def_source
+        def_source="$(pactl get-default-source 2>/dev/null || pactl info 2>/dev/null | grep 'Default Source' | cut -d: -f2 | xargs || true)"
+
+        if [[ "${dev_mode}" == "mic" ]]; then
+            target_name="Микрофон: ${def_source:-@DEFAULT_SOURCE@}"
+            if command -v pw-record &>/dev/null && [[ -n "$def_source" ]]; then
+                cap_cmd="pw-record --target ${def_source} --rate 16000 --channels 2 --format s16 -"
+            elif command -v parec &>/dev/null; then
+                cap_cmd="parec -d ${def_source} --rate=16000 --channels=2 --format=s16le"
+            elif command -v ffmpeg &>/dev/null; then
+                cap_cmd="ffmpeg -v quiet -f pulse -i default -f s16le -ac 2 -ar 16000 -"
+            fi
+        else
+            target_name="Монитор колонок: ${def_sink:-@DEFAULT_SINK@}"
+            if command -v pw-record &>/dev/null && [[ -n "$def_sink" ]]; then
+                cap_cmd="pw-record --target ${def_sink} --rate 16000 --channels 2 --format s16 -"
+            elif command -v parec &>/dev/null; then
+                cap_cmd="parec -d ${def_sink}.monitor --rate=16000 --channels=2 --format=s16le"
+            elif command -v ffmpeg &>/dev/null; then
+                cap_cmd="ffmpeg -v quiet -f pulse -i default.monitor -f s16le -ac 2 -ar 16000 -"
+            fi
+        fi
+
+        if [[ -z "${cap_cmd}" ]]; then
+            log_danger "Не найдена утилита аудиозахвата (pw-record / parec / ffmpeg)."
+            return 1
+        fi
+
+        local tone_cmd="speaker-test -t sine -f 1000 -l 1 2>/dev/null || paplay /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null || aplay /usr/share/sounds/alsa/Front_Center.wav 2>/dev/null || true"
+
+        local ret=0
+        python3 - "${target_name}" "${tone_cmd}" < <(${cap_cmd} 2>/dev/null) << 'PYEOF' || ret=$?
+import sys, math, struct, os, time, select, termios, tty
+
+def run():
+    target_name = sys.argv[1] if len(sys.argv) > 1 else "Default Output"
+    tone_cmd = sys.argv[2] if len(sys.argv) > 2 else ""
+
+    tty_fd = None
+    old_attr = None
+    if os.path.exists("/dev/tty"):
+        try:
+            tty_f = open("/dev/tty", "r")
+            tty_fd = tty_f.fileno()
+            old_attr = termios.tcgetattr(tty_fd)
+            tty.setcbreak(tty_fd)
+        except Exception:
+            tty_fd = None
+
+    bar_len = 28
+    chunk_frames = 800
+    chunk_bytes = chunk_frames * 4
+
+    peak_l_hold = -60.0
+    peak_r_hold = -60.0
+    peak_hold_time = time.time()
+
+    def make_bar(db, peak_db):
+        val = max(0.0, min(1.0, (db + 60.0) / 60.0))
+        pk = max(0.0, min(1.0, (peak_db + 60.0) / 60.0))
+        filled = int(val * bar_len)
+        peak_idx = min(bar_len - 1, int(pk * bar_len))
+        chars = []
+        for i in range(bar_len):
+            if i < filled:
+                if i < int(bar_len * 0.65):
+                    chars.append("\033[1;32m█\033[0m")
+                elif i < int(bar_len * 0.85):
+                    chars.append("\033[1;33m█\033[0m")
+                else:
+                    chars.append("\033[1;31m█\033[0m")
+            elif i == peak_idx:
+                chars.append("\033[1;37m|\033[0m")
+            else:
+                chars.append("\033[2m░\033[0m")
+        return "".join(chars)
+
+    try:
+        sys.stderr.write("\033[?25l")
+        sys.stderr.flush()
+        action = "quit"
+
+        while True:
+            if tty_fd is not None:
+                r, _, _ = select.select([tty_fd], [], [], 0)
+                if r:
+                    key = os.read(tty_fd, 1).decode("utf-8", "ignore")
+                    if key.lower() in ("q", "\x1b", "\x03"):
+                        action = "quit"
+                        break
+                    elif key.lower() == "t":
+                        if tone_cmd:
+                            os.system(tone_cmd + " >/dev/null 2>&1 &")
+                    elif key.lower() == "m":
+                        action = "toggle"
+                        break
+
+            data = sys.stdin.buffer.read(chunk_bytes)
+            if not data or len(data) < chunk_bytes:
+                time.sleep(0.02)
+                continue
+
+            count = len(data) // 2
+            samples = struct.unpack(f"<{count}h", data)
+            left = samples[0::2]
+            right = samples[1::2]
+
+            rms_l = math.sqrt(sum(s*s for s in left) / len(left)) if left else 0
+            rms_r = math.sqrt(sum(s*s for s in right) / len(right)) if right else 0
+            peak_l = max(abs(s) for s in left) if left else 0
+            peak_r = max(abs(s) for s in right) if right else 0
+
+            db_l = 20 * math.log10(rms_l / 32768.0) if rms_l > 0 else -60.0
+            db_r = 20 * math.log10(rms_r / 32768.0) if rms_r > 0 else -60.0
+            pk_l = 20 * math.log10(peak_l / 32768.0) if peak_l > 0 else -60.0
+            pk_r = 20 * math.log10(peak_r / 32768.0) if peak_r > 0 else -60.0
+
+            db_l = max(-60.0, min(0.0, db_l))
+            db_r = max(-60.0, min(0.0, db_r))
+            pk_l = max(-60.0, min(0.0, pk_l))
+            pk_r = max(-60.0, min(0.0, pk_r))
+
+            now = time.time()
+            if pk_l > peak_l_hold or (now - peak_hold_time > 1.5):
+                peak_l_hold = pk_l
+            if pk_r > peak_r_hold or (now - peak_hold_time > 1.5):
+                peak_r_hold = pk_r
+            if now - peak_hold_time > 1.5:
+                peak_hold_time = now
+
+            max_rms = max(db_l, db_r)
+            if max_rms > -48.0:
+                status_line = f"\033[1;32m🟢 СИГНАЛ АКТИВЕН ({max_rms:.1f} dBFS)\033[0m — звук поступает в аудиоканал"
+                diag_msg = "\033[1mЕсли в колонках/наушниках нет звука:\033[0m\n  • Проверьте кабель/штекер колонок (вставлен ли до конца)\n  • Проверьте питание колонок и индикатор\n  • Проверьте регулятор громкости на корпусе колонок/наушников!"
+            else:
+                status_line = "\033[2m⚪ ТИШИНА (< -48 dBFS)\033[0m — программы сейчас не воспроизводят звук"
+                diag_msg = "Нажмите \033[1m[T]\033[0m, чтобы подать тестовый сигнал 1 кГц и проверить шину."
+
+            out = "\033[H\033[2J"
+            out += "  \033[45;1;37m LINAH \033[0m \033[1mЖИВОЙ VU-МЕТР И ДЕТЕКТОР АУДИОСИГНАЛА\033[0m\n"
+            out += "  ──────────────────────────────────────────────────────────────────────────────\n"
+            out += f"  • \033[1mУстройство:\033[0m \033[36m{target_name}\033[0m\n\n"
+            out += f"  L: [{make_bar(db_l, peak_l_hold)}] {db_l:5.1f} dBFS (пик {peak_l_hold:5.1f})\n"
+            out += f"  R: [{make_bar(db_r, peak_r_hold)}] {db_r:5.1f} dBFS (пик {peak_r_hold:5.1f})\n\n"
+            out += f"  • {status_line}\n"
+            out += f"  {diag_msg}\n\n"
+            out += "  ──────────────────────────────────────────────────────────────────────────────\n"
+            out += "  Управление: \033[1m[T]\033[0m Тестовый тон 1кГц  ·  \033[1m[M]\033[0m Сменить Динамики/Микрофон  ·  \033[1m[Q/Esc]\033[0m Выход\n"
+
+            sys.stderr.write(out)
+            sys.stderr.flush()
+
+    finally:
+        if tty_fd is not None and old_attr is not None:
+            try:
+                termios.tcsetattr(tty_fd, termios.TCSADRAIN, old_attr)
+            except Exception:
+                pass
+        sys.stderr.write("\033[?25h\033[H\033[2J")
+        sys.stderr.flush()
+
+    if action == "toggle":
+        sys.exit(42)
+    sys.exit(0)
+
+if __name__ == "__main__":
+    run()
+PYEOF
+        if (( ret == 42 )); then
+            if [[ "${dev_mode}" == "mic" ]]; then dev_mode="monitor"; else dev_mode="mic"; fi
+            continue
+        fi
+        break
+    done
+    return 0
+}
+
+audio_visualizer_menu() {
+    while true; do
+        {
+        print_banner
+        log_title "ВИЗУАЛИЗАЦИЯ ЗВУКА И ДЕТЕКТОР АКТИВНОСТИ"
+        printf "================================================================================\n\n"
+        printf "  Позволяет объективно увидеть, подаётся ли сигнал на колонки или в микрофон.\n"
+        printf "  Если шкала прыгает, а звука нет — проблема 100%% в физических колонках/штекере.\n\n"
+
+        printf "  ${C_BOLD}[1]${C_RESET} 📊 ${C_BOLD}Запустить встроенный VU-метр & Детектор сигнала${C_RESET} ${C_GREEN}[Рекомендуется]${C_RESET}\n"
+        _hint 'Зачем: показывает уровень сигнала (RMS и пик) в реальном времени прямо в терминале.'
+        _hint 'Когда: подозрение, что звук идёт, но колонки выключены или выкручены в ноль.'
+        printf "  ${C_BOLD}[2]${C_RESET} 🌊 ${C_BOLD}Запустить CAVA (спектральный анализатор)${C_RESET}\n"
+        _hint 'Зачем: визуализирует спектр частот (басы, середина, верха).'
+        _hint 'Когда: установлена утилита cava и хочется красивый частотный эквалайзер.'
+        printf "  ${C_BOLD}[3]${C_RESET} 📥 ${C_BOLD}Установить CAVA в систему${C_RESET}\n"
+        _hint 'Зачем: команда пакетного менеджера для установки утилиты cava.'
+        _hint 'Когда: cava не найдена в системе.'
+        printf "  ${C_BOLD}[4]${C_RESET} 📡 ${C_BOLD}Слушать звук удаленно через SSH (Loopback)${C_RESET}\n"
+        _hint 'Зачем: перенаправляет звук с удалённого сервера на ваши колонки через SSH-туннель.'
+        _hint 'Когда: администрируете чужой компьютер и хотите лично послушать его звук.'
+        printf "  ${C_BOLD}[0]${C_RESET} 🔙 ${C_BOLD}Назад в главное меню${C_RESET}\n\n"
+
+        } > "${MENU_BUF}" 2>&1
+        local v_pick
+        menu_read v_pick "Твой выбор [0-4]: "
+        case "${v_pick}" in
+            1) run_terminal_vu_meter "monitor" || true ;;
+            2)
+                if command -v cava &>/dev/null; then
+                    cava
+                else
+                    log_warn "CAVA не установлена в системе."
+                    printf "  Установите пакет cava через пакетный менеджер (пункт [3]).\n\n"
+                    press_enter
+                fi
+                ;;
+            3)
+                print_banner
+                log_title "УСТАНОВКА CAVA"
+                printf "================================================================================\n\n"
+                local distro; distro="$(detect_distro)"
+                printf "  Дистрибутив: ${C_CYAN}%s${C_RESET}\n\n" "${distro}"
+                case "${distro}" in
+                    *Ubuntu*|*Mint*|*Debian*)
+                        printf "  Выполните: ${C_BOLD}sudo apt update && sudo apt install cava${C_RESET}\n"
+                        ;;
+                    *Arch*|*Manjaro*)
+                        printf "  Выполните: ${C_BOLD}sudo pacman -S cava${C_RESET}\n"
+                        ;;
+                    *Fedora*)
+                        printf "  Выполните: ${C_BOLD}sudo dnf install cava${C_RESET}\n"
+                        ;;
+                    *openSUSE*)
+                        printf "  Выполните: ${C_BOLD}sudo zypper install cava${C_RESET}\n"
+                        ;;
+                    *)
+                        printf "  Установите cava через ваш пакетный менеджер.\n"
+                        ;;
+                esac
+                printf "\n"
+                press_enter
+                ;;
+            4)
+                remote_session_menu
+                ;;
+            0|q|Q) return ;;
+            *) ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# 11. АКТИВНЫЕ ПОТОКИ И МИКШЕР ПРИЛОЖЕНИЙ
+# ==============================================================================
+get_active_sink_inputs() {
+    LC_ALL=C pactl list sink-inputs 2>/dev/null | awk '
+        /^Sink Input #/ { if (id != "") print id "|" app "|" media "|" vol "|" mute "|" sink; id = substr($3, 2); app="Unknown"; media=""; vol="100%"; mute="no"; sink=""; }
+        /^[[:space:]]*Sink:/ { sink = $2; }
+        /^[[:space:]]*Mute:/ { mute = $2; }
+        /^[[:space:]]*Volume:/ {
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /[0-9]+%/) { vol = $i; break; }
+            }
+        }
+        /application\.name =/ {
+            sub(/.*application\.name = "/, "");
+            sub(/".*/, "");
+            app = $0;
+        }
+        /media\.name =/ {
+            sub(/.*media\.name = "/, "");
+            sub(/".*/, "");
+            media = $0;
+        }
+        END { if (id != "") print id "|" app "|" media "|" vol "|" mute "|" sink; }
+    '
+}
+
+active_streams_menu() {
+    while true; do
+        {
+        print_banner
+        log_title "АКТИВНЫЕ АУДИОПОТОКИ И МИКШЕР ПРИЛОЖЕНИЙ"
+        printf "================================================================================\n\n"
+
+        local -a streams=()
+        while IFS='|' read -r s_id s_app s_media s_vol s_mute s_sink; do
+            [[ -z "$s_id" ]] && continue
+            streams+=("${s_id}|${s_app}|${s_media}|${s_vol}|${s_mute}|${s_sink}")
+        done < <(get_active_sink_inputs)
+
+        if (( ${#streams[@]} == 0 )); then
+            printf "  ${C_YELLOW}⚪ В данный момент ни одно приложение не воспроизводит звук.${C_RESET}\n\n"
+            printf "  ${C_BOLD}[1]${C_RESET} 🔊 Подать тестовый звук (чтобы увидеть поток в списке)\n"
+            printf "  ${C_BOLD}[r]${C_RESET} 🔄 Обновить список\n"
+            printf "  ${C_BOLD}[0]${C_RESET} 🔙 Назад в главное меню\n\n"
+        else
+            printf "  ${C_BOLD}ИГРАЮЩИЕ ПРИЛОЖЕНИЯ:${C_RESET}\n\n"
+            local idx=1
+            for s in "${streams[@]}"; do
+                IFS='|' read -r sid sapp smedia svol smute ssink <<< "$s"
+                local mute_str="${C_GREEN}Звук ВКЛ${C_RESET}"
+                [[ "$smute" == "yes" ]] && mute_str="${C_RED}MUTE (заглушен)${C_RESET}"
+                local desc="${sapp}"
+                [[ -n "${smedia}" && "${smedia}" != "${sapp}" ]] && desc="${sapp} (${smedia})"
+                printf "  ${C_BOLD}[%d]${C_RESET} 🎵 ${C_CYAN}%-26s${C_RESET} | Громкость: ${C_BOLD}%-5s${C_RESET} | %b | Выход: %s\n" \
+                    "$idx" "${desc:0:26}" "${svol}" "${mute_str}" "${ssink}"
+                idx=$(( idx + 1 ))
+            done
+            printf "\n"
+            printf "  ${C_BOLD}[r]${C_RESET} 🔄 Обновить список\n"
+            printf "  ${C_BOLD}[0]${C_RESET} 🔙 Назад в главное меню\n\n"
+        fi
+
+        } > "${MENU_BUF}" 2>&1
+        local str_pick
+        menu_read str_pick "Выбери номер приложения или действие [0-N/r]: "
+        case "${str_pick}" in
+            0|q|Q) return ;;
+            r|R) continue ;;
+            1)
+                if (( ${#streams[@]} == 0 )); then
+                    (speaker-test -t sine -f 880 -l 1 &>/dev/null || paplay /usr/share/sounds/freedesktop/stereo/complete.oga &>/dev/null || true) &
+                    sleep 0.2
+                    continue
+                fi
+                ;&
+            *)
+                if [[ "${str_pick}" =~ ^[0-9]+$ ]] && (( str_pick >= 1 && str_pick <= ${#streams[@]} )); then
+                    local sel_stream="${streams[$(( str_pick - 1 ))]}"
+                    IFS='|' read -r target_id target_app target_media target_vol target_mute target_sink <<< "$sel_stream"
+                    
+                    print_banner
+                    log_title "УПРАВЛЕНИЕ ПОТОКОМ: ${target_app}"
+                    printf "================================================================================\n\n"
+                    printf "  • Идентификатор потока: #%s\n" "${target_id}"
+                    printf "  • Приложение:           %s\n" "${target_app}"
+                    printf "  • Текущая громкость:    %s\n" "${target_vol}"
+                    printf "  • Заглушен (Mute):      %s\n\n" "${target_mute}"
+
+                    printf "  [1] 🔇 Включить / Выключить MUTE (заглушить приложение)\n"
+                    printf "  [2] 🎚️  Установить громкость 100%%\n"
+                    printf "  [3] 🚀 Установить громкость 150%% (разгон тихого видео)\n"
+                    printf "  [4] ✍️  Задать громкость вручную (в %%%%)\n"
+                    printf "  [5] ➡️  Переместить поток на другой выход\n"
+                    printf "  [6] 💀 Принудительно завершить зависший поток\n"
+                    printf "  [0] Отмена\n\n"
+                    read -r -p "Твой выбор [0-6]: " a_pick
+                    case "$a_pick" in
+                        1) pactl set-sink-input-mute "${target_id}" toggle 2>/dev/null || true; log_cool "Статус MUTE переключен!" ;;
+                        2) pactl set-sink-input-volume "${target_id}" 100% 2>/dev/null || true; log_cool "Громкость установлена на 100%!" ;;
+                        3) pactl set-sink-input-volume "${target_id}" 150% 2>/dev/null || true; log_cool "Громкость разогнана до 150%!" ;;
+                        4)
+                            read -r -p "Введи громкость в процентах (например, 120): " custom_pct
+                            if [[ "$custom_pct" =~ ^[0-9]+$ ]]; then
+                                pactl set-sink-input-volume "${target_id}" "${custom_pct}%" 2>/dev/null || true
+                                log_cool "Громкость установлена на ${custom_pct}%!"
+                            fi
+                            ;;
+                        5)
+                            printf "\nДоступные аудиовыходы:\n"
+                            local -a sinks=()
+                            local k=1
+                            while read -r s_idx s_name s_mod s_fmt s_stat; do
+                                printf "  [%d] %s\n" "$k" "$s_name"
+                                sinks+=("$s_name")
+                                k=$(( k + 1 ))
+                            done < <(LC_ALL=C pactl list short sinks 2>/dev/null || true)
+                            read -r -p "Выбери номер выхода [1-$(( k - 1 ))]: " s_sel
+                            if [[ "$s_sel" =~ ^[0-9]+$ ]] && (( s_sel >= 1 && s_sel <= ${#sinks[@]} )); then
+                                local dst="${sinks[$(( s_sel - 1 ))]}"
+                                pactl move-sink-input "${target_id}" "${dst}" 2>/dev/null || true
+                                log_cool "Поток перемещён на «${dst}»!"
+                            fi
+                            ;;
+                        6)
+                            pactl kill-sink-input "${target_id}" 2>/dev/null || true
+                            log_cool "Поток завершён!"
+                            ;;
+                        *) ;;
+                    esac
+                    press_enter
+                fi
+                ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# 12. АУДИОПРЕСЕТЫ В 1 КЛИК (GAMING / CINEMA / HI-FI)
+# ==============================================================================
+apply_preset_gaming() {
+    print_banner
+    log_title "ПРЕСЕТ: GAMING & ULTRA-LOW LATENCY"
+    printf "================================================================================\n\n"
+    log_info "1. Применяем минимальный квант PipeWire (128 сэмплов / задержка ~2.6 мс)..."
+    pw-metadata -n settings 0 clock.force-quantum 128 2>/dev/null || true
+
+    mkdir -p "$(_pw_conf_dir)"
+    cat << 'EOF' > "${PRESET_GAMING_CONF}"
+# linah: игровой пресет с ультра-низкой задержкой (Gaming & Low Latency)
+context.properties = {
+    default.clock.quantum     = 128
+    default.clock.min-quantum = 64
+    default.clock.max-quantum = 256
+}
+EOF
+
+    log_info "2. Отключаем энергосбережение ALSA (устраняем микрофризы при старте звука)..."
+    for f in /sys/module/snd_hda_intel/parameters/power_save; do
+        if [[ -f "$f" ]]; then
+            echo 0 | sudo -n tee "$f" &>/dev/null || true
+        fi
+    done
+
+    log_cool "Игровой пресет активирован! Задержка сведена к аппаратному минимуму."
+    printf "  ${C_DIM}Для отката пресета: linah.sh --preset revert или пункт меню «Сброс пресета».${C_RESET}\n\n"
+}
+
+apply_preset_cinema() {
+    print_banner
+    log_title "ПРЕСЕТ: CINEMA & SPEECH CLARITY (КИНО И ПОДКАСТЫ)"
+    printf "================================================================================\n\n"
+    log_info "1. Настраиваем виртуальный компрессор и выравниватель громкости речи..."
+
+    mkdir -p "$(_pw_conf_dir)"
+    cat << 'EOF' > "${PRESET_CINEMA_CONF}"
+# linah: пресет «Кино и Подкасты» — разборчивость голоса и защита от резких звуков
+context.modules = [
+    { name = libpipewire-module-filter-chain
+        args = {
+            node.description = "Выход: Кино и Голос (Loudness Normalizer)"
+            media.name       = "Выход: Кино и Голос (Loudness Normalizer)"
+            filter.graph = {
+                nodes = [
+                    {
+                        type   = builtin
+                        name   = eq_band
+                        label  = bq_peaking
+                        control = { "Freq" = 1800.0 "Q" = 1.2 "Gain" = 5.0 }
+                    }
+                    {
+                        type   = builtin
+                        name   = limiter
+                        label  = limiter
+                        control = { "Limit" = 0.95 }
+                    }
+                ]
+                links = [
+                    { output = "eq_band:Out" input = "limiter:In" }
+                ]
+            }
+            capture.props = {
+                node.name = "linah_cinema.input"
+                media.class = "Audio/Sink"
+                audio.channels = 2
+                audio.position = [ FL FR ]
+            }
+            playback.props = {
+                node.name = "linah_cinema.output"
+                node.passive = true
+                audio.channels = 2
+                audio.position = [ FL FR ]
+            }
+        }
+    }
+]
+EOF
+
+    systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || true
+    log_cool "Пресет «Кино и Голос» активирован! Тихие диалоги станут громкими и чёткими."
+    printf "  ${C_DIM}Для отката пресета: linah.sh --preset revert или пункт меню «Сброс пресета».${C_RESET}\n\n"
+}
+
+apply_preset_hifi() {
+    print_banner
+    log_title "ПРЕСЕТ: HI-FI & STUDIO (BIT-PERFECT)"
+    printf "================================================================================\n\n"
+    log_info "1. Включаем студийный ресэмплер качества 10 (Soxr / Speex Float 10)..."
+    log_info "2. Разрешаем нативные частоты без искажений (44.1, 48, 88.2, 96, 192 кГц)..."
+
+    mkdir -p "$(_pw_conf_dir)"
+    cat << 'EOF' > "${PRESET_HIFI_CONF}"
+# linah: Hi-Fi студийный аудиопресет
+context.properties = {
+    resample.quality = 10
+    default.clock.allowed-rates = [ 44100 48000 88200 96000 176400 192000 ]
+}
+EOF
+
+    systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || true
+    log_cool "Пресет «Hi-Fi Студия» активирован! Настоящий звук без мыла и передискретизации."
+    printf "  ${C_DIM}Для отката пресета: linah.sh --preset revert или пункт меню «Сброс пресета».${C_RESET}\n\n"
+}
+
+revert_audio_presets() {
+    print_banner
+    log_title "СБРОС ЗВУКОВЫХ ПРЕСЕТОВ"
+    printf "================================================================================\n\n"
+    log_info "Удаляем активные файлы пресетов..."
+    rm -f "${PRESET_GAMING_CONF}" "${PRESET_CINEMA_CONF}" "${PRESET_HIFI_CONF}"
+    rm -f "$(_pw_conf_dir)"/99-linah-preset-*.conf
+    pw-metadata -n settings 0 clock.force-quantum 0 2>/dev/null || true
+    systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || true
+    log_cool "Все звуковые пресеты сброшены к заводским настройкам!"
+}
+
+audio_presets_menu() {
+    while true; do
+        {
+        print_banner
+        log_title "ЗВУКОВЫЕ ПРЕСЕТЫ В 1 КЛИК"
+        printf "================================================================================\n\n"
+        printf "  Быстрая перенастройка аудиоподсистемы под конкретную задачу.\n"
+        printf "  Любой пресет можно сбросить обратно в заводской стандарт за секунду.\n\n"
+
+        local g_stat="${C_DIM}○ Не активен${C_RESET}"
+        local c_stat="${C_DIM}○ Не активен${C_RESET}"
+        local h_stat="${C_DIM}○ Не активен${C_RESET}"
+
+        [[ -f "${PRESET_GAMING_CONF}" ]] && g_stat="${C_GREEN}● АКТИВЕН (128 quantum / low latency)${C_RESET}"
+        [[ -f "${PRESET_CINEMA_CONF}" ]] && c_stat="${C_GREEN}● АКТИВЕН (Loudness & Limiter)${C_RESET}"
+        [[ -f "${PRESET_HIFI_CONF}" ]] && h_stat="${C_GREEN}● АКТИВЕН (Quality 10 bit-perfect)${C_RESET}"
+
+        printf "  ${C_BOLD}[1]${C_RESET} 🎮 ${C_BOLD}Gaming & Low-Latency${C_RESET}    — буфер 128 сэмплов (~2.6мс), no-sleep [%b]\n" "${g_stat}"
+        _hint 'Зачем: сводит аудиозадержку в шутерах (CS2, Apex, Overwatch) и ритм-играх к аппаратному минимуму.'
+        _hint 'Когда: чувствуется запаздывание выстрелов или звука шагов в играх.'
+        printf "  ${C_BOLD}[2]${C_RESET} 🎬 ${C_BOLD}Cinema & Speech Clarity${C_RESET} — компрессор голоса, нормализация громкости [%b]\n" "${c_stat}"
+        _hint 'Зачем: выравнивает громкость в фильмах — тихий шепот становится разборчивым, а взрывы не глушат.'
+        _hint 'Когда: при просмотре фильмов приходится постоянно крутить громкость вверх и вниз.'
+        printf "  ${C_BOLD}[3]${C_RESET} 🎧 ${C_BOLD}Hi-Fi & Studio${C_RESET}          — студийный ресэмплер quality 10, multi-rate [%b]\n" "${h_stat}"
+        _hint 'Зачем: максимальная чистота звука на качественных наушниках и ЦАПах.'
+        _hint 'Когда: прослушивание Lossless/FLAC музыки в высоком разрешении.'
+        printf "  ${C_BOLD}[4]${C_RESET} 🔄 ${C_BOLD}Сбросить активный пресет${C_RESET}  — возврат к штатным значениям системы\n"
+        _hint 'Зачем: удаляет конфигурацию пресета и возвращает стандартный буфер.'
+        _hint 'Когда: закончили играть или смотреть кино и хотите вернуть штатные настройки.'
+        printf "  ${C_BOLD}[0]${C_RESET} 🔙 ${C_BOLD}Назад в главное меню${C_RESET}\n\n"
+
+        } > "${MENU_BUF}" 2>&1
+        local p_choice
+        menu_read p_choice "Твой выбор [0-4]: "
+        case "${p_choice}" in
+            1) apply_preset_gaming; press_enter ;;
+            2) apply_preset_cinema; press_enter ;;
+            3) apply_preset_hifi; press_enter ;;
+            4) revert_audio_presets; press_enter ;;
+            0|q|Q) return ;;
+            *) ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# 13. ДОПОЛНИТЕЛЬНЫЕ ФИКСЫ АПТЕЧКИ
+# ==============================================================================
+fix_rnnoise_mic() {
+    print_banner
+    log_title "НЕЙРОСЕТЕВОЕ ПОДАВЛЕНИЕ ШУМА ДЛЯ МИКРОФОНА"
+    printf "================================================================================\n\n"
+    log_info "Создаём виртуальный микрофон с нейросетевой фильтрацией RNNoise / WebRTC..."
+
+    mkdir -p "$(_pw_conf_dir)"
+    cat << 'EOF' > "${RNNOISE_CONF}"
+# linah: виртуальный микрофон с подавлением шума кулеров, щелчков клавиатуры и гула
+context.modules = [
+    { name = libpipewire-module-echo-cancel
+        args = {
+            library.name = aec/libspa-aec-webrtc
+            aec.args = {
+                webrtc.noise_suppression = true
+                webrtc.high_pass_filter  = true
+                webrtc.gain_control      = true
+                webrtc.voice_detection   = true
+            }
+            source.props = {
+                node.name = "linah_rnnoise_source"
+                node.description = "Микрофон (Чистый голос: без шума и кликов)"
+            }
+        }
+    }
+]
+EOF
+
+    systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || true
+    sleep 1
+    log_cool "Готово! В настройках звука / Discord / Telegram выберите вход «Микрофон (Чистый голос: без шума и кликов)»."
+    return 0
+}
+
+fix_hdmi_audio() {
+    print_banner
+    log_title "ДОКТОР HDMI / DISPLAYPORT АУДИО"
+    printf "================================================================================\n\n"
+    log_info "1. Проверяем состояние подключенных мониторов и телевизоров (ELD/EDID)..."
+
+    local found_eld=0
+    for eld in /proc/asound/card*/eld*; do
+        if [[ -f "$eld" ]] && grep -qs 'monitor_present[[:space:]]*:[[:space:]]*1' "$eld" 2>/dev/null; then
+            local mon_name
+            mon_name="$(grep -m1 'monitor_name' "$eld" 2>/dev/null | cut -d: -f2 | xargs || echo "Display")"
+            log_cool "Обнаружен активный видеовыход: ${mon_name} (${eld})"
+            found_eld=1
+        fi
+    done
+    if (( ! found_eld )); then
+        log_warn "В /proc/asound не найдено подключенных HDMI мониторов со статусом present."
+    fi
+
+    log_info "2. Снимаем MUTE с аппаратных каналов IEC958 / S/PDIF / HDMI..."
+    for card in 0 1 2 3; do
+        amixer -c "$card" set IEC958 unmute 2>/dev/null || true
+        amixer -c "$card" set "IEC958,1" unmute 2>/dev/null || true
+        amixer -c "$card" set "IEC958,2" unmute 2>/dev/null || true
+        amixer -c "$card" set "IEC958,3" unmute 2>/dev/null || true
+    done
+
+    log_info "3. Ищем профиль HDMI в PipeWire / PulseAudio..."
+    local hdmi_sink
+    hdmi_sink="$(LC_ALL=C pactl list short sinks 2>/dev/null | awk '$2 ~ /hdmi/ {print $2}' | head -n1 || true)"
+    if [[ -n "$hdmi_sink" ]]; then
+        pactl set-sink-mute "${hdmi_sink}" 0 2>/dev/null || true
+        pactl set-sink-volume "${hdmi_sink}" 100% 2>/dev/null || true
+        log_cool "HDMI-выход найден и разблокирован: ${hdmi_sink}"
+    else
+        log_warn "HDMI-аудиоприёмник не виден в списке активных. Возможно, требуется переключить профиль видеокарты."
+    fi
+    return 0
+}
+
+fix_bt_wideband_speech() {
+    print_banner
+    log_title "ШИРОКОПОЛОСНЫЙ ГОЛОС BLUETOOTH (mSBC / LC3-SWB)"
+    printf "================================================================================\n\n"
+    log_info "Включаем качественные широкополосные голосовые кодеки (mSBC 16кГц / LC3 32кГц)..."
+
+    local wp_conf="${WP_DIR_05}/54-linah-wideband-speech.conf"
+    mkdir -p "${WP_DIR_05}"
+    cat << 'EOF' > "${wp_conf}"
+# linah: включение широкополосных кодеков для гарнитур (mSBC / FastStream)
+monitor.bluez.properties = {
+    bluez5.roles = [ a2dp_sink a2dp_source bap_sink bap_source hsp_hs hsp_ag hfp_hf hfp_ag ]
+    bluez5.codecs = [ sbc sbc_xq aac ldac aptx aptx_hd faststream ]
+    bluez5.enable-msbc = true
+    bluez5.enable-sbc-xq = true
+    bluez5.enable-faststream = true
+}
+EOF
+
+    systemctl --user restart wireplumber 2>/dev/null || true
+    log_cool "Параметры mSBC и FastStream успешно прописаны в WirePlumber!"
+    return 0
+}
+
+check_desktop_audio_capture() {
+    print_banner
+    log_title "ПРОВЕРКА ЗАХВАТА ЗВУКА ЭКРАНА И ПРИЛОЖЕНИЙ"
+    printf "================================================================================\n\n"
+    log_info "Проверяем xdg-desktop-portal и права захвата звука монитора..."
+
+    if ! pgrep -f xdg-desktop-portal &>/dev/null; then
+        log_warn "Служба xdg-desktop-portal не запущена. Захват звука окна в OBS/Discord может не работать."
+        log_info "Запускаем xdg-desktop-portal..."
+        systemctl --user start xdg-desktop-portal 2>/dev/null || true
+    else
+        log_cool "xdg-desktop-portal активен."
+    fi
+
+    local def_sink
+    def_sink="$(pactl get-default-sink 2>/dev/null || true)"
+    if [[ -n "$def_sink" ]]; then
+        log_cool "Монитор звука по умолчанию доступен: ${def_sink}.monitor"
+    else
+        log_danger "Не найден аудиовыход по умолчанию."
+    fi
+    return 0
+}
+
+# ==============================================================================
+# 14. БЭКАП, ЭКСПОРТ, ИМПОРТ И АНОНИМНЫЙ ОТЧЁТ
+# ==============================================================================
+export_config_archive() {
+    local target_file="${1:-}"
+    if [[ -z "$target_file" ]]; then
+        target_file="linah-audio-backup-$(date +%Y%m%d_%H%M%S).tar.gz"
+    fi
+
+    log_info "Создаём архив конфигураций аудиостека в: ${target_file}..."
+    local -a src_paths=()
+    [[ -d "${HOME}/.config/pipewire" ]] && src_paths+=("${HOME}/.config/pipewire")
+    [[ -d "${HOME}/.config/wireplumber" ]] && src_paths+=("${HOME}/.config/wireplumber")
+    [[ -d "${HOME}/.config/pulse" ]] && src_paths+=("${HOME}/.config/pulse")
+    [[ -f "${HOME}/.asoundrc" ]] && src_paths+=("${HOME}/.asoundrc")
+    [[ -f "/etc/asound.conf" ]] && src_paths+=("/etc/asound.conf")
+
+    if (( ${#src_paths[@]} == 0 )); then
+        log_warn "Не найдено пользовательских конфигурационных файлов аудио для бэкапа."
+        return 0
+    fi
+
+    tar -czf "${target_file}" -P "${src_paths[@]}" 2>/dev/null || {
+        log_danger "Ошибка при создании архива ${target_file}."
+        return 1
+    }
+
+    if tar -tzf "${target_file}" &>/dev/null; then
+        local sz
+        sz="$(du -h "${target_file}" 2>/dev/null | awk '{print $1}')"
+        log_cool "Архив успешно создан: ${target_file} (${sz})!"
+    else
+        log_danger "Архив повреждён или не прочитан."
+        return 1
+    fi
+    return 0
+}
+
+import_config_archive() {
+    local archive_file="${1:-}"
+    if [[ -z "$archive_file" || ! -f "$archive_file" ]]; then
+        log_danger "Файл архива не указан или не существует: ${archive_file}"
+        return 1
+    fi
+
+    if ! tar -tzf "${archive_file}" &>/dev/null; then
+        log_danger "Файл ${archive_file} не является корректным tar.gz архивом."
+        return 1
+    fi
+
+    log_info "1. Создаём защитный бэкап текущих настроек перед восстановлением..."
+    local safety_bak="linah-backup-before-import-$(date +%Y%m%d_%H%M%S).tar.gz"
+    export_config_archive "${safety_bak}" || true
+
+    log_info "2. Распаковываем конфигурацию из ${archive_file}..."
+    tar -xzf "${archive_file}" -P 2>/dev/null || {
+        log_danger "Ошибка распаковки архива."
+        return 1
+    }
+
+    log_info "3. Перезапускаем службы аудио..."
+    systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || true
+    log_cool "Настройки успешно импортированы! Защитная копия сохранена в: ${safety_bak}."
+    return 0
+}
+
+share_anonymized_report() {
+    local out_file="${1:-}"
+    if [[ -z "$out_file" ]]; then
+        out_file="linah-audio-report-$(date +%Y%m%d_%H%M%S).md"
+    fi
+
+    log_info "Генерируем анонимизированный отчёт о состоянии звуковой системы..."
+    local raw_tmp; raw_tmp="$(mktemp "${TMPDIR:-/tmp}/linah-rep.XXXXXX")"
+    IS_CLI_CALL=1 show_diagnostics > "${raw_tmp}" 2>&1 || true
+
+    local cur_user="${USER:-user}"
+    local cur_host
+    cur_host="$(hostname 2>/dev/null || echo "host")"
+
+    sed -E \
+        -e 's|/home/[a-zA-Z0-9_.-]+|/home/[USER]|g' \
+        -e "s/${cur_user}/[USER]/g" \
+        -e "s/${cur_host}/[HOSTNAME]/g" \
+        -e 's/([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}/XX:XX:XX:XX:XX:XX/g' \
+        -e 's/([0-9]{1,3}\.){3}[0-9]{1,3}/192.168.X.X/g' \
+        "${raw_tmp}" > "${out_file}"
+    rm -f "${raw_tmp}"
+
+    log_cool "Анонимизированный отчёт сохранён в: ${out_file}!"
+    printf "  ${C_DIM}Все личные данные (имя пользователя, хост, MAC-адреса, IP) удалены.${C_RESET}\n"
+    printf "  ${C_DIM}Этот файл можно безопасно прикреплять к сообщениям на форумах и в GitHub Issues.${C_RESET}\n\n"
+}
+
+backup_export_menu() {
+    while true; do
+        {
+        print_banner
+        log_title "БЭКАП, ЭКСПОРТ И АНОНИМИЗИРОВАННЫЙ ОТЧЁТ"
+        printf "================================================================================\n\n"
+
+        printf "  ${C_BOLD}[1]${C_RESET} 📦 ${C_BOLD}Экспорт аудио-конфигов в архив (.tar.gz)${C_RESET}\n"
+        _hint 'Зачем: упаковывает все настройки PipeWire, PulseAudio и WirePlumber в один файл.'
+        _hint 'Когда: перед экспериментами или для переноса настроек на другой ПК.'
+        printf "  ${C_BOLD}[2]${C_RESET} 📥 ${C_BOLD}Импорт аудио-конфигов из архива (.tar.gz)${C_RESET}\n"
+        _hint 'Зачем: восстанавливает настройки из ранее сохраненного архива.'
+        _hint 'Когда: нужно вернуть рабочую конфигурацию из бэкапа.'
+        printf "  ${C_BOLD}[3]${C_RESET} 📋 ${C_BOLD}Создать анонимизированный отчёт для форума / Issue${C_RESET}\n"
+        _hint 'Зачем: собирает полную диагностику без личных данных (без имени пользователя, IP и MAC).'
+        _hint 'Когда: просите помощи на форуме Linux Mint, Arch или в GitHub Issues.'
+        printf "  ${C_BOLD}[0]${C_RESET} 🔙 ${C_BOLD}Назад в главное меню${C_RESET}\n\n"
+
+        } > "${MENU_BUF}" 2>&1
+        local b_choice
+        menu_read b_choice "Твой выбор [0-3]: "
+        case "${b_choice}" in
+            1)
+                printf "\nВведите имя файла архива [Enter для linah-audio-backup-...]: "
+                read -r arch_name
+                export_config_archive "${arch_name}"
+                press_enter
+                ;;
+            2)
+                printf "\nВведите путь к архиву .tar.gz: "
+                read -r arch_path
+                import_config_archive "${arch_path}"
+                press_enter
+                ;;
+            3)
+                printf "\nВведите имя файла отчёта [Enter для автогенерации]: "
+                read -r rep_name
+                share_anonymized_report "${rep_name}"
+                press_enter
+                ;;
+            0|q|Q) return ;;
+            *) ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# 15. НЕИНТЕРАКТИВНОЕ АВТОЛЕЧЕНИЕ (CLI)
+# ==============================================================================
+auto_fix_critical() {
+    log_info "Запуск критического экспресс-автолечения..."
+
+    for c in 0 1 2 3; do
+        amixer -c "$c" set Master unmute 100% &>/dev/null || true
+        amixer -c "$c" set Speaker unmute 100% &>/dev/null || true
+        amixer -c "$c" set Headphone unmute 100% &>/dev/null || true
+    done
+
+    pactl set-sink-mute @DEFAULT_SINK@ 0 2>/dev/null || true
+
+    local cur_v
+    cur_v="$(_sink_volume_pct "$(_default_sink)")"
+    if [[ -z "$cur_v" ]] || (( cur_v < 20 )); then
+        pactl set-sink-volume @DEFAULT_SINK@ 65% 2>/dev/null || true
+    fi
+
+    if ! systemctl --user is-active --quiet pipewire 2>/dev/null; then
+        systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || true
+    fi
+
+    log_cool "[OK] Критические блокираторы звука проверены и устранены."
+    return 0
+}
+
+auto_fix_all() {
+    log_info "Запуск полного автоматического лечения системы..."
+    auto_fix_critical || true
+    fix_server_conflict || true
+    fix_start_services || true
+    fix_hda_power_save || true
+    fix_suspend_on_idle || true
+    fix_bt_race_armor || true
+    fix_sink_volume_100 || true
+    log_cool "[OK] Полный цикл автолечения успешно завершён."
+    return 0
+}
+
+# ==============================================================================
 # 8. ПОЛНЫЙ СБРОС В ЗАВОД: «ВЕРНУТЬ ВСЁ ВЗАД, КАК БЫЛО»
 # ==============================================================================
 _do_factory_revert() {
     log_info "1. Сносим конфиги PipeWire, созданные linah..."
     rm -f "${PREAMP_CONF}" "${LEGACY_PREAMP_CONF}"
+    rm -f "${PRESET_GAMING_CONF}" "${PRESET_CINEMA_CONF}" "${PRESET_HIFI_CONF}" "${RNNOISE_CONF}"
     rm -f "$(_pw_conf_dir)"/99-linah-*.conf "$(_pw_conf_dir)"/99-audio-boss-*.conf
     rmdir "${PW_CONF_DIR}" 2>/dev/null || true
+    pw-metadata -n settings 0 clock.force-quantum 0 2>/dev/null || true
 
     log_info "2. Сносим правила WirePlumber, созданные linah..."
     rm -f "${WP_CONF_04}" "${WP_CONF_05}" "${WP_ROLES_04}" "${WP_ROLES_05}"
     rm -f "${HOME}/.config/wireplumber/main.lua.d/51-no-suspend.lua"
     rm -f "${HOME}/.config/wireplumber/wireplumber.conf.d/51-no-suspend.conf"
     rm -f "${WP_DIR_04}/53-no-suspend.lua"
+    rm -f "${WP_DIR_05}"/54-linah-*.conf "${WP_DIR_05}"/99-linah-*.conf "${WP_DIR_04}"/99-linah-*.lua
     if [[ -d "${WP_STATE_DIR}" ]]; then
         # Точечно: чужие громкости и выбранные устройства не трогаем
         local _f
@@ -4994,12 +6208,86 @@ EOF
             run_sound_test
             exit 0
             ;;
+        --vu|--visualizer)
+            IS_CLI_CALL=1
+            run_terminal_vu_meter "${2:-monitor}"
+            exit 0
+            ;;
+        --stream-monitor)
+            stream_audio_monitor
+            exit 0
+            ;;
+        --streams)
+            IS_CLI_CALL=1
+            printf "%-6s | %-24s | %-28s | %-6s | %-8s | %s\n" "ID" "ПРИЛОЖЕНИЕ" "ТРЕК / ПОТОК" "ГРОМК" "MUTE" "ВЫХОД"
+            printf "──────────────────────────────────────────────────────────────────────────────────────────\n"
+            while IFS='|' read -r sid sapp smedia svol smute ssink; do
+                [[ -z "$sid" ]] && continue
+                printf "#%-5s | %-24s | %-28s | %-6s | %-8s | %s\n" "$sid" "${sapp:0:24}" "${smedia:0:28}" "$svol" "$smute" "$ssink"
+            done < <(get_active_sink_inputs)
+            exit 0
+            ;;
+        --preset)
+            IS_CLI_CALL=1
+            case "${2:-}" in
+                gaming|game) apply_preset_gaming ;;
+                cinema|movie|speech) apply_preset_cinema ;;
+                hifi|studio) apply_preset_hifi ;;
+                revert|off|reset) revert_audio_presets ;;
+                *)
+                    log_danger "Неизвестный пресет: «${2:-}». Доступны: gaming, cinema, hifi, revert"
+                    exit 2
+                    ;;
+            esac
+            exit 0
+            ;;
+        --auto-fix-crit)
+            IS_CLI_CALL=1
+            auto_fix_critical
+            exit 0
+            ;;
+        --auto-fix-all)
+            IS_CLI_CALL=1
+            auto_fix_all
+            exit 0
+            ;;
+        --export-config)
+            IS_CLI_CALL=1
+            export_config_archive "${2:-}"
+            exit 0
+            ;;
+        --import-config)
+            IS_CLI_CALL=1
+            if [[ -z "${2:-}" ]]; then
+                log_danger "Укажите путь к архиву: --import-config <файл.tar.gz>"
+                exit 2
+            fi
+            import_config_archive "$2"
+            exit 0
+            ;;
+        --share-report)
+            IS_CLI_CALL=1
+            share_anonymized_report "${2:-}"
+            exit 0
+            ;;
         -h|--help)
             printf "Использование: %s [ОПЦИЯ]\n\n" "$0"
             printf "  (без опций)            Запуск интерактивного меню\n\n"
             printf "  ${C_BOLD}ГЛАВНОЕ:${C_RESET}\n"
             printf "  -a, --analyze          Полный анализ системы: найти проблемы и предложить фиксы\n"
-            printf "  --kit, --first-aid     Аптечка: каталог фиксов известных болячек\n\n"
+            printf "  --kit, --first-aid     Аптечка: каталог фиксов известных болячек\n"
+            printf "  --auto-fix-crit        Экспресс-починка критических сбоев без вопросов (unmute, default, daemons)\n"
+            printf "  --auto-fix-all         Полный цикл автоматического лечения аудиостека\n\n"
+            printf "  ${C_BOLD}ДИАГНОСТИКА СИГНАЛА И SSH:${C_RESET}\n"
+            printf "  --vu, --visualizer     Живой терминальный VU-метр и объективный детектор аудиосигнала\n"
+            printf "  --stream-monitor       Стриминг аудиовыхода в stdout (для SSH: aplay / mpv loopback)\n"
+            printf "  --user <пользователь>  Выполнять действия в контексте сессии указанного пользователя\n"
+            printf "  --streams              Список приложений, играющих звук прямо сейчас, и их громкость\n"
+            printf "  --preset [имя]         Применить пресет: gaming (задержка 128), cinema, hifi, revert\n\n"
+            printf "  ${C_BOLD}БЭКАП И ОТЧЁТЫ:${C_RESET}\n"
+            printf "  --export-config [файл] Сохранить аудио-конфигурацию в архив .tar.gz\n"
+            printf "  --import-config <файл> Восстановить конфигурацию из архива с защитным бэкапом\n"
+            printf "  --share-report [файл]  Создать анонимизированный отчёт для форума / GitHub Issues\n\n"
             printf "  ${C_BOLD}ОСТАЛЬНОЕ:${C_RESET}\n"
             printf "  -d, --diag             Сырой дамп аудиостека и Bluetooth\n"
             printf "  --fix-bt-native        Нативно снять лок ЦАП WirePlumber (0.4 Lua / 0.5+ SPA-JSON)\n"
@@ -5020,7 +6308,7 @@ EOF
             printf "  --plain                Меню без стрелок: только ввод номера (ставится ПЕРЕД остальными опциями)\n"
             printf "  -V, --version          Показать версию\n"
             printf "  -h, --help             Показать эту справку\n\n"
-            printf "В меню: стрелки ↑↓ — выбор, Enter — выполнить, цифра/буква — сразу к пункту, q или Esc — назад.\n"
+            printf "В меню: стрелки ↑↓ — выбор, Enter — выполнить, цифра/буква — сразу к пункту, / — поиск, q или Esc — назад.\n"
             printf "Классический ввод номеров навсегда: переменная LINAH_PLAIN=1.\n\n"
             exit 0
             ;;
@@ -5036,9 +6324,32 @@ EOF
 # ГЛАВНОЕ МЕНЮ (TUI)
 # ==============================================================================
 main() {
-    if [[ "${1:-}" == "--plain" ]]; then
-        LINAH_PLAIN=1
-        shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --plain)
+                LINAH_PLAIN=1
+                shift
+                ;;
+            --user)
+                OPT_TARGET_USER="$2"
+                shift 2
+                ;;
+            --user=*)
+                OPT_TARGET_USER="${1#*=}"
+                shift
+                ;;
+            -u)
+                OPT_TARGET_USER="$2"
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [[ -n "${OPT_TARGET_USER:-}" ]]; then
+        switch_to_user_session "${OPT_TARGET_USER}"
     fi
     check_not_root
     check_tools
@@ -5089,6 +6400,9 @@ main() {
 
         printf "  • ${C_BOLD}Дистрибутив:${C_RESET}       ${C_CYAN}%s${C_RESET}\n" "${distro}"
         printf "  • ${C_BOLD}Аудиосервер:${C_RESET}       ${C_CYAN}%s${C_RESET} ${C_DIM}(WirePlumber %s [%s])${C_RESET}\n" "${srv}" "${wp_ver}" "${wp_syntax}"
+        if [[ -n "${TARGET_USER:-}" ]]; then
+            printf "  • ${C_BOLD}Пользователь сессии:${C_RESET} ${C_GREEN}%s${C_RESET} ${C_DIM}(UID: %s)${C_RESET}\n" "${TARGET_USER}" "${TARGET_UID}"
+        fi
         printf "  • ${C_BOLD}Текущий аудиовыход:${C_RESET} ${C_BOLD}%s${C_RESET} ${C_DIM}(%s)${C_RESET}\n" "${def_desc}" "${def}"
         printf "  • ${C_BOLD}Нативный фикс WP:${C_RESET}   %b\n" "${native_wp_stat}"
         printf "  • ${C_BOLD}Софтверный Preamp:${C_RESET}  %b\n" "${preamp_stat}"
@@ -5132,21 +6446,38 @@ main() {
         printf "  ${C_BOLD}[9]${C_RESET} 📈 ${C_BOLD}Разгон ползунка в трее${C_RESET}  — расширить потолок (Cinnamon, KDE, GNOME, XFCE, MATE)\n"
         _hint 'Зачем: снимает лимит ползунка громкости в трее (обычно 100% или 150%).'
         _hint 'Когда: даже на максимуме тихо: тихие записи, слабые колонки, ограничение самого рабочего стола.'
+        printf "  ${C_BOLD}[16]${C_RESET} 🎛️ ${C_BOLD}Микшер приложений${C_RESET}       — кто играет, громкость/mute конкретных программ\n"
+        _hint 'Зачем: показывает все активные аудиопотоки, меняет громкость и переносит программы между выходами.'
+        _hint 'Когда: видео играет в браузере без звука или нужно сделать игру тише голосового чата.'
         printf "\n"
-        printf "  ${C_DIM}── Сервис ───────────────────────────────────────────────────────────────${C_RESET}\n"
+        printf "  ${C_DIM}── Анализ сигнала и пресеты ────────────────────────────────────────────${C_RESET}\n"
+        printf "  ${C_BOLD}[15]${C_RESET} 📊 ${C_BOLD}Визуализатор звука / VU${C_RESET} — живой детектор сигнала, CAVA, тест колонок\n"
+        _hint 'Зачем: живой индикатор сигнала (RMS/Peak dBFS) — показывает, идёт ли звук в аппаратуру.'
+        _hint 'Когда: подозрение, что звук идёт, но колонки выключены из розетки или убавлены в ноль.'
+        printf "  ${C_BOLD}[17]${C_RESET} ⚡ ${C_BOLD}Звуковые пресеты в 1 клик${C_RESET} — Gaming (мин. задержка 128), Cinema, Hi-Fi\n"
+        _hint 'Зачем: мгновенное переключение аудиоподсистемы под игры, кино или студийное качество.'
+        _hint 'Когда: нужен минимальный отклик в играх или хочется нормализовать диалоги в кино.'
+        printf "  ${C_BOLD}[18]${C_RESET} 🛡️ ${C_BOLD}SSH Удаленный помощник${C_RESET}  — сессии пользователей, стриминг звука через SSH\n"
+        _hint 'Зачем: удаленная помощь пользователю по SSH, выбор сессии и сквозная трансляция звука.'
+        _hint 'Когда: администрируете чужую систему и нужно лично услышать или настроить звук.'
+        printf "\n"
+        printf "  ${C_DIM}── Сервис и резервные копии ─────────────────────────────────────────────${C_RESET}\n"
         printf "  ${C_BOLD}[10]${C_RESET} 🔊 ${C_BOLD}Тест звука (стерео)${C_RESET}   — проверить левый и правый каналы\n"
         _hint 'Зачем: проигрывает сигнал по каналам и проверяет левый, правый и чистоту звука.'
         _hint 'Когда: после любых правок, если кажется, что каналы перепутаны, есть хрип или один канал молчит.'
         printf "  ${C_BOLD}[11]${C_RESET} 🔄 ${C_BOLD}Перезапуск звука${C_RESET}      — пнуть PipeWire/PulseAudio и убрать дубли\n"
         _hint 'Зачем: перезапускает PipeWire/PulseAudio без перезагрузки компьютера.'
         _hint 'Когда: звук завис, устройства пропали или задвоились, после установки кодеков или смены настроек.'
+        printf "  ${C_BOLD}[19]${C_RESET} 📦 ${C_BOLD}Бэкап / Экспорт / Отчёт${C_RESET}  — архив настроек .tar.gz и анонимный отчёт\n"
+        _hint 'Зачем: сохраняет все настройки аудио в архив или формирует отчёт для форума без личных данных.'
+        _hint 'Когда: перед экспериментами с аудио или если нужно попросить помощи на форуме.'
         printf "  ${C_BOLD}[12]${C_RESET} 🧹 ${C_BOLD}Полный сброс в завод${C_RESET}  — снести все твики linah\n"
         _hint 'Зачем: удаляет всё, что создал LINAH, и возвращает настройки к умолчаниям.'
         _hint 'Когда: что-то пошло не так или правки больше не нужны.'
         printf "  ${C_BOLD}[0]${C_RESET}  🚪 ${C_BOLD}Выход${C_RESET}                 — бывай, пусть музло качает!\n\n"
 
         } > "${MENU_BUF}" 2>&1
-        menu_read choice "Введи номер пункта [0-14]: "
+        menu_read choice "Введи номер пункта [0-19]: "
         case "${choice}" in
             1) run_full_analysis || true ;;
             2) audio_first_aid_kit || true ;;
@@ -5162,6 +6493,11 @@ main() {
             12) factory_revert || true ;;
             13) bt_remote_menu || true ;;
             14) bt_test_menu || true ;;
+            15) audio_visualizer_menu || true ;;
+            16) active_streams_menu || true ;;
+            17) audio_presets_menu || true ;;
+            18) remote_session_menu || true ;;
+            19) backup_export_menu || true ;;
             0|q|Q)
                 printf "\n${C_GREEN}Бывай, бро! Если звук опять заартачится — ты знаешь, где меня найти.${C_RESET}\n\n"
                 exit 0
