@@ -4891,12 +4891,16 @@ stream_audio_monitor() {
         echo "Error: Default sink not found" >&2
         return 1
     fi
+    local snk_mon="${def_sink}"
+    [[ "${snk_mon}" != *.monitor ]] && snk_mon="${snk_mon}.monitor"
+    local pw_tgt="${def_sink%.monitor}"
+
     if command -v pw-record &>/dev/null; then
-        exec pw-record --target "$def_sink" --rate 44100 --channels 2 --format s16 - 2>/dev/null
+        exec pw-record -P '{ stream.capture.sink = true }' --target "$pw_tgt" --rate 44100 --channels 2 --format s16 - 2>/dev/null
     elif command -v parec &>/dev/null; then
-        exec parec -d "${def_sink}.monitor" --rate=44100 --channels=2 --format=s16le 2>/dev/null
+        exec parec -d "$snk_mon" --rate=44100 --channels=2 --format=s16le 2>/dev/null
     elif command -v ffmpeg &>/dev/null; then
-        exec ffmpeg -v quiet -f pulse -i "${def_sink}.monitor" -f s16le -ac 2 -ar 44100 - 2>/dev/null
+        exec ffmpeg -v quiet -f pulse -i "$snk_mon" -f s16le -ac 2 -ar 44100 - 2>/dev/null
     else
         echo "Error: No capture utility (pw-record, parec, ffmpeg) found" >&2
         return 1
@@ -5022,45 +5026,252 @@ remote_session_menu() {
 # ==============================================================================
 # 10. ВИЗУАЛИЗАТОР ЗВУКА, ЖИВОЙ VU-МЕТР И ДЕТЕКТОР СИГНАЛА
 # ==============================================================================
-run_terminal_vu_meter() {
-    if ! command -v python3 &>/dev/null; then
-        log_danger "Для работы терминального VU-метра требуется python3."
+# Helper: get formatted list of sinks: name|state|desc
+_get_sinks_details() {
+    LC_ALL=C pactl list sinks 2>/dev/null | awk '
+        /^Sink #/ { if (name != "") print name "|" state "|" desc; in_s=1; name=""; desc=""; state=""; next }
+        /^Source #/ { in_s=0 }
+        in_s && /^[ \t]*Name: / { sub(/^[ \t]*Name: /, ""); name=$0 }
+        in_s && /^[ \t]*State: / { sub(/^[ \t]*State: /, ""); state=$0 }
+        in_s && /^[ \t]*Description: / { sub(/^[ \t]*Description: /, ""); desc=$0 }
+        END { if (name != "") print name "|" state "|" desc }
+    '
+}
+
+# Helper: get formatted list of sources (microphones): name|state|desc
+_get_sources_details() {
+    LC_ALL=C pactl list sources 2>/dev/null | awk '
+        /^Source #/ { if (name != "" && name !~ /\.monitor$/) print name "|" state "|" desc; in_s=1; name=""; desc=""; state=""; next }
+        in_s && /^[ \t]*Name: / { sub(/^[ \t]*Name: /, ""); name=$0 }
+        in_s && /^[ \t]*State: / { sub(/^[ \t]*State: /, ""); state=$0 }
+        in_s && /^[ \t]*Description: / { sub(/^[ \t]*Description: /, ""); desc=$0 }
+        END { if (name != "" && name !~ /\.monitor$/) print name "|" state "|" desc }
+    '
+}
+
+# Helper: get human description of a sink or source
+_get_audio_device_desc() {
+    local target="$1"
+    local mode="${2:-sink}"
+    local desc=""
+    if [[ "$mode" == "mic" || "$mode" == "source" ]]; then
+        desc="$(_get_sources_details | grep -F "${target}|" | head -n1 | cut -d'|' -f3 || true)"
+    else
+        desc="$(_get_sinks_details | grep -F "${target}|" | head -n1 | cut -d'|' -f3 || true)"
+    fi
+    echo "${desc:-$target}"
+}
+
+# Helper: interactive device picker for monitoring
+select_monitoring_device() {
+    local mode="${1:-sink}"
+    local def_name=""
+    local names=()
+    local states=()
+    local descs=()
+
+    if [[ "$mode" == "mic" || "$mode" == "source" ]]; then
+        def_name="$(pactl get-default-source 2>/dev/null || pactl info 2>/dev/null | grep 'Default Source' | cut -d: -f2 | xargs || true)"
+        while IFS='|' read -r name state desc; do
+            [[ -z "$name" ]] && continue
+            names+=("$name")
+            states+=("$state")
+            descs+=("$desc")
+        done < <(_get_sources_details)
+    else
+        def_name="$(pactl get-default-sink 2>/dev/null || pactl info 2>/dev/null | grep 'Default Sink' | cut -d: -f2 | xargs || true)"
+        while IFS='|' read -r name state desc; do
+            [[ -z "$name" ]] && continue
+            names+=("$name")
+            states+=("$state")
+            descs+=("$desc")
+        done < <(_get_sinks_details)
+    fi
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+        log_warn "В системе не найдено доступных аудиоустройств этого типа."
         press_enter
         return 1
     fi
 
-    local dev_mode="${1:-monitor}"
+    print_banner
+    if [[ "$mode" == "mic" || "$mode" == "source" ]]; then
+        log_title "ВЫБОР МИКРОФОНА ДЛЯ МОНИТОРИНГА"
+    else
+        log_title "ВЫБОР УСТРОЙСТВА ВЫВОДА ДЛЯ МОНИТОРИНГА"
+    fi
+    printf "================================================================================\n\n"
+    printf "  Выберите аудиоустройство, с которого нужно снимать и анализировать звук:\n\n"
+
+    local i
+    for (( i=0; i<${#names[@]}; i++ )); do
+        local n="${names[$i]}"
+        local d="${descs[$i]}"
+        local s="${states[$i]}"
+        local def_tag=""
+        [[ "$n" == "$def_name" ]] && def_tag=" ${C_GREEN}[ПО УМОЛЧАНИЮ]${C_RESET}"
+        local state_tag=""
+        if [[ "$s" == "RUNNING" ]]; then
+            state_tag=" ${C_CYAN}[АКТИВНО ИГРАЕТ ЗВУК]${C_RESET}"
+        elif [[ "$s" == "IDLE" ]]; then
+            state_tag=" ${C_GRAY}[ГОТОВ]${C_RESET}"
+        fi
+
+        printf "  ${C_BOLD}[%d]${C_RESET} 🔊 ${C_BOLD}%s${C_RESET}%s%s\n" "$((i+1))" "$d" "$def_tag" "$state_tag"
+        printf "      ${C_GRAY}Узел: %s${C_RESET}\n\n" "$n"
+    done
+    printf "  ${C_BOLD}[0]${C_RESET} 🔙 Отмена (оставить текущее устройство)\n\n"
+
+    local choice
+    menu_read choice "Выберите номер устройства [0-${#names[@]}]: "
+    if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && (( choice <= ${#names[@]} )); then
+        VU_SELECTED_TARGET="${names[$((choice-1))]}"
+        log_cool "Выбрано: ${descs[$((choice-1))]}"
+        sleep 0.5
+        return 0
+    fi
+    return 1
+}
+
+# Zero-dependency fallback: pure POSIX AWK engine
+_run_awk_vu_meter() {
+    local dev_title="$1"
+    local dev_type="$2"
+    local dev_target="$3"
+    local cap_cmd="$4"
+
+    local od_cmd="od -v -An -s -w4"
+    if ! command -v od &>/dev/null; then
+        od_cmd="hexdump -v -e '2/2 \"%7d \" \"\n\"'"
+    fi
+
+    trap 'printf "\033[?25h\033[0m\n"' INT TERM EXIT
+
+    eval "stdbuf -i0 -o0 -e0 ${cap_cmd}" 2>/dev/null | \
+    eval "stdbuf -i0 -o0 -e0 ${od_cmd}" 2>/dev/null | \
+    LC_ALL=C awk -v title="${dev_title}" -v dtype="${dev_type}" -v target="${dev_target}" '
+    BEGIN {
+        count = 0; max_cnt = 800; sum_l = 0; sum_r = 0; pk_l = 0; pk_r = 0;
+        bar_w = 26;
+        printf "\033[?25l\033[H\033[2J";
+    }
+    function make_bar(db, val, filled, i, str) {
+        val = (db + 60.0) / 60.0;
+        if (val < 0) val = 0; if (val > 1) val = 1;
+        filled = int(val * bar_w);
+        str = "";
+        for (i = 0; i < bar_w; i++) {
+            if (i < filled) {
+                if (i < int(bar_w * 0.65)) str = str "\033[1;32m█\033[0m";
+                else if (i < int(bar_w * 0.85)) str = str "\033[1;33m█\033[0m";
+                else str = str "\033[1;31m█\033[0m";
+            } else {
+                str = str "\033[2m░\033[0m";
+            }
+        }
+        return str;
+    }
+    {
+        vl = $1 + 0; vr = $2 + 0;
+        if (vl == -32768 && vr == -32768 && count == 0) next;
+        sum_l += vl * vl; sum_r += vr * vr;
+        al = (vl < 0) ? -vl : vl; ar = (vr < 0) ? -vr : vr;
+        if (al > pk_l) pk_l = al; if (ar > pk_r) pk_r = ar;
+        count++;
+        if (count >= max_cnt) {
+            rms_l = sqrt(sum_l / count); rms_r = sqrt(sum_r / count);
+            db_l = (rms_l > 0) ? 20 * (log(rms_l / 32768.0) / log(10)) : -60.0;
+            db_r = (rms_r > 0) ? 20 * (log(rms_r / 32768.0) / log(10)) : -60.0;
+            if (db_l < -60.0) db_l = -60.0; if (db_r < -60.0) db_r = -60.0;
+            if (db_l > 0.0) db_l = 0.0;     if (db_r > 0.0) db_r = 0.0;
+
+            max_rms = (db_l > db_r) ? db_l : db_r;
+            if (max_rms > -48.0) {
+                st = "\033[1;32m🟢 СИГНАЛ АКТИВЕН (" sprintf("%.1f", max_rms) " dBFS)\033[0m — звук поступает в аудиоканал";
+                diag = "\033[1mЕсли в колонках/наушниках нет звука:\033[0m\n  • Проверьте кабель/штекер (вставлен ли до конца)\n  • Проверьте питание колонок и выключатель на корпусе\n  • Проверьте регулятор громкости на самих колонках/наушниках!";
+            } else {
+                st = "\033[2m⚪ ТИШИНА (< -48 dBFS)\033[0m — программы сейчас не воспроизводят звук";
+                diag = "Звуковой поток свободен. Запустите музыку, видео или звонок.";
+            }
+
+            printf "\033[H";
+            printf "  \033[45;1;37m LINAH \033[0m \033[1mЖИВОЙ VU-МЕТР И ДЕТЕКТОР АУДИОСИГНАЛА [POSIX AWK]\033[0m\n";
+            printf "  ──────────────────────────────────────────────────────────────────────────────\n";
+            printf "  • \033[1mРежим захвата:\033[0m   \033[36m%s\033[0m\n", dtype;
+            printf "  • \033[1mУстройство:\033[0m       \033[1;37m%s\033[0m\n", title;
+            printf "  • \033[1mСистемный узел:\033[0m   \033[2m%s\033[0m\n\n", target;
+            printf "  L: [%s] %5.1f dBFS\n", make_bar(db_l), db_l;
+            printf "  R: [%s] %5.1f dBFS\n\n", make_bar(db_r), db_r;
+            printf "  • %s\n\n", st;
+            printf "  %s\n\n", diag;
+            printf "  ──────────────────────────────────────────────────────────────────────────────\n";
+            printf "  \033[2m(Движок: pure POSIX awk+coreutils · Для выхода нажмите Ctrl+C)\033[0m\n";
+            fflush();
+            count = 0; sum_l = 0; sum_r = 0; pk_l = 0; pk_r = 0;
+        }
+    }
+    END {
+        printf "\033[?25h\033[0m\n";
+    }
+    ' || true
+}
+
+run_terminal_vu_meter() {
+    local dev_mode="${1:-sink}"
+    local target_dev="${2:-${VU_SELECTED_TARGET:-}}"
+
     while true; do
-        local target_name=""
-        local cap_cmd=""
         local def_sink
         def_sink="$(pactl get-default-sink 2>/dev/null || pactl info 2>/dev/null | grep 'Default Sink' | cut -d: -f2 | xargs || true)"
         local def_source
         def_source="$(pactl get-default-source 2>/dev/null || pactl info 2>/dev/null | grep 'Default Source' | cut -d: -f2 | xargs || true)"
 
-        if [[ "${dev_mode}" == "mic" ]]; then
-            local src_target="${def_source:-@DEFAULT_AUDIO_SOURCE@}"
-            target_name="Микрофон: ${src_target}"
+        local target_name=""
+        local target_node=""
+        local target_type=""
+        local cap_cmd=""
+        local tone_cmd=""
+
+        if [[ "${dev_mode}" == "mic" || "${dev_mode}" == "source" ]]; then
+            target_node="${target_dev:-$def_source}"
+            [[ -z "$target_node" ]] && target_node="@DEFAULT_AUDIO_SOURCE@"
+            target_name="$(_get_audio_device_desc "$target_node" "mic")"
+            [[ "$target_node" == "$def_source" ]] && target_name="${target_name} [По умолчанию]"
+            target_type="ВХОД МИКРОФОНА (запись звука с микрофона)"
+
             if command -v pw-record &>/dev/null; then
-                cap_cmd="pw-record --target \"${src_target}\" --rate 16000 --channels 2 --format s16 -"
+                cap_cmd="pw-record --target \"${target_node}\" --rate 16000 --channels 2 --format s16 -"
             elif command -v parec &>/dev/null; then
-                local p_arg=""
-                [[ -n "${def_source}" ]] && p_arg="-d \"${def_source}\""
-                cap_cmd="parec ${p_arg} --rate=16000 --channels=2 --format=s16le"
+                cap_cmd="parec -d \"${target_node}\" --rate=16000 --channels=2 --format=s16le"
             elif command -v ffmpeg &>/dev/null; then
-                cap_cmd="ffmpeg -v quiet -f pulse -i default -f s16le -ac 2 -ar 16000 -"
+                cap_cmd="ffmpeg -v quiet -f pulse -i \"${target_node}\" -f s16le -ac 2 -ar 16000 -"
             fi
+            tone_cmd=""
         else
-            local snk_target="${def_sink:-@DEFAULT_AUDIO_SINK@}"
-            target_name="Монитор колонок: ${snk_target}"
+            target_node="${target_dev:-$def_sink}"
+            [[ -z "$target_node" ]] && target_node="@DEFAULT_AUDIO_SINK@"
+            target_name="$(_get_audio_device_desc "$target_node" "sink")"
+            [[ "$target_node" == "$def_sink" ]] && target_name="${target_name} [По умолчанию]"
+            target_type="ВЫХОД ЗВУКА (монитор колонок / наушников)"
+
+            local snk_mon="${target_node}"
+            [[ "${snk_mon}" != *.monitor ]] && snk_mon="${snk_mon}.monitor"
+            local pw_tgt="${target_node%.monitor}"
+
             if command -v pw-record &>/dev/null; then
-                cap_cmd="pw-record --target \"${snk_target}\" --rate 16000 --channels 2 --format s16 -"
+                cap_cmd="pw-record -P '{ stream.capture.sink = true }' --target \"${pw_tgt}\" --rate 16000 --channels 2 --format s16 -"
             elif command -v parec &>/dev/null; then
-                local p_arg=""
-                [[ -n "${def_sink}" ]] && p_arg="-d \"${def_sink}.monitor\""
-                cap_cmd="parec ${p_arg} --rate=16000 --channels=2 --format=s16le"
+                cap_cmd="parec -d \"${snk_mon}\" --rate=16000 --channels=2 --format=s16le"
             elif command -v ffmpeg &>/dev/null; then
-                cap_cmd="ffmpeg -v quiet -f pulse -i default.monitor -f s16le -ac 2 -ar 16000 -"
+                cap_cmd="ffmpeg -v quiet -f pulse -i \"${snk_mon}\" -f s16le -ac 2 -ar 16000 -"
+            fi
+
+            if command -v pw-play &>/dev/null; then
+                tone_cmd="pw-play --target \"${pw_tgt}\" /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null || pw-play --target \"${pw_tgt}\" /usr/share/sounds/alsa/Front_Center.wav 2>/dev/null || true"
+            elif command -v paplay &>/dev/null; then
+                tone_cmd="paplay -d \"${pw_tgt}\" /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null || paplay -d \"${pw_tgt}\" /usr/share/sounds/alsa/Front_Center.wav 2>/dev/null || true"
+            else
+                tone_cmd="speaker-test -t sine -f 880 -l 1 2>/dev/null || true"
             fi
         fi
 
@@ -5070,7 +5281,11 @@ run_terminal_vu_meter() {
             return 1
         fi
 
-        local tone_cmd="speaker-test -t sine -f 1000 -l 1 2>/dev/null || paplay /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null || aplay /usr/share/sounds/alsa/Front_Center.wav 2>/dev/null || true"
+        # If python3 is not available, use the zero-dependency pure AWK engine
+        if ! command -v python3 &>/dev/null; then
+            _run_awk_vu_meter "${target_name}" "${target_type}" "${target_node}" "${cap_cmd}"
+            return 0
+        fi
 
         read -r -d '' PY_VU_SCRIPT << 'PYEOF' || true
 import sys, math, struct, os, time, select, termios, tty, signal
@@ -5079,7 +5294,9 @@ if hasattr(signal, 'SIGPIPE'):
 
 def run():
     target_name = sys.argv[1] if len(sys.argv) > 1 else "Default Output"
-    tone_cmd = sys.argv[2] if len(sys.argv) > 2 else ""
+    target_type = sys.argv[2] if len(sys.argv) > 2 else "ВЫХОД ЗВУКА"
+    target_node = sys.argv[3] if len(sys.argv) > 3 else ""
+    tone_cmd    = sys.argv[4] if len(sys.argv) > 4 else ""
 
     tty_fd = None
     old_attr = None
@@ -5151,7 +5368,10 @@ def run():
                         if tone_cmd:
                             os.system(tone_cmd + " >/dev/null 2>&1 &")
                     elif key.lower() == "m":
-                        action = "toggle"
+                        action = "toggle_mode"
+                        break
+                    elif key.lower() == "d":
+                        action = "switch_device"
                         break
             else:
                 if frames > 10:
@@ -5181,6 +5401,10 @@ def run():
             data = bytes(buf)
             count = len(data) // 2
             samples = struct.unpack(f"<{count}h", data)
+
+            if any(s == -8531 for s in samples[:8]):
+                continue
+
             left = samples[0::2]
             right = samples[1::2]
 
@@ -5210,7 +5434,7 @@ def run():
             max_rms = max(db_l, db_r)
             if max_rms > -48.0:
                 status_line = f"\033[1;32m🟢 СИГНАЛ АКТИВЕН ({max_rms:.1f} dBFS)\033[0m — звук поступает в аудиоканал"
-                diag_msg = "\033[1mЕсли в колонках/наушниках нет звука:\033[0m\n  • Проверьте кабель/штекер колонок (вставлен ли до конца)\n  • Проверьте питание колонок и индикатор\n  • Проверьте регулятор громкости на корпусе колонок/наушников!"
+                diag_msg = "\033[1mЕсли в колонках/наушниках нет звука:\033[0m\n  • Проверьте кабель/штекер колонок (вставлен ли до конца)\n  • Проверьте питание колонок и индикатор на корпусе\n  • Проверьте регулятор громкости на самих колонках/наушниках!"
             else:
                 status_line = "\033[2m⚪ ТИШИНА (< -48 dBFS)\033[0m — программы сейчас не воспроизводят звук"
                 diag_msg = "Нажмите \033[1m[T]\033[0m, чтобы подать тестовый сигнал 1 кГц и проверить шину."
@@ -5218,13 +5442,16 @@ def run():
             out = "\033[H\033[2J"
             out += "  \033[45;1;37m LINAH \033[0m \033[1mЖИВОЙ VU-МЕТР И ДЕТЕКТОР АУДИОСИГНАЛА\033[0m\n"
             out += "  ──────────────────────────────────────────────────────────────────────────────\n"
-            out += f"  • \033[1mУстройство:\033[0m \033[36m{target_name}\033[0m\n\n"
+            out += f"  • \033[1mРежим захвата:\033[0m   \033[36m{target_type}\033[0m\n"
+            out += f"  • \033[1mУстройство:\033[0m       \033[1;37m{target_name}\033[0m\n"
+            out += f"  • \033[1mСистемный узел:\033[0m   \033[2m{target_node}\033[0m\n\n"
             out += f"  L: [{make_bar(db_l, peak_l_hold)}] {db_l:5.1f} dBFS (пик {peak_l_hold:5.1f})\n"
             out += f"  R: [{make_bar(db_r, peak_r_hold)}] {db_r:5.1f} dBFS (пик {peak_r_hold:5.1f})\n\n"
             out += f"  • {status_line}\n"
             out += f"  {diag_msg}\n\n"
             out += "  ──────────────────────────────────────────────────────────────────────────────\n"
-            out += "  Управление: \033[1m[T]\033[0m Тестовый тон 1кГц  ·  \033[1m[M]\033[0m Сменить Динамики/Микрофон  ·  \033[1m[Q/Esc]\033[0m Выход\n"
+            out += "  Управление: \033[1m[T]\033[0m Тестовый тон 1кГц  ·  \033[1m[M]\033[0m Сменить Режим (Выход/Микрофон)\n"
+            out += "              \033[1m[D]\033[0m Сменить Аудиоустройство  ·  \033[1m[Q/Esc]\033[0m Выход в меню\n"
 
             try:
                 sys.stdout.write(out)
@@ -5245,8 +5472,10 @@ def run():
         except (BrokenPipeError, IOError):
             pass
 
-    if action == "toggle":
+    if action == "toggle_mode":
         sys.exit(42)
+    elif action == "switch_device":
+        sys.exit(43)
     sys.exit(0)
 
 if __name__ == "__main__":
@@ -5254,9 +5483,20 @@ if __name__ == "__main__":
 PYEOF
 
         local ret=0
-        python3 -c "${PY_VU_SCRIPT}" "${target_name}" "${tone_cmd}" < <(eval "${cap_cmd}" 2>/dev/null) || ret=$?
+        python3 -c "${PY_VU_SCRIPT}" "${target_name}" "${target_type}" "${target_node}" "${tone_cmd}" < <(eval "${cap_cmd}" 2>/dev/null) || ret=$?
         if (( ret == 42 )); then
-            if [[ "${dev_mode}" == "mic" ]]; then dev_mode="monitor"; else dev_mode="mic"; fi
+            if [[ "${dev_mode}" == "mic" || "${dev_mode}" == "source" ]]; then
+                dev_mode="sink"
+            else
+                dev_mode="mic"
+            fi
+            target_dev=""
+            VU_SELECTED_TARGET=""
+            continue
+        elif (( ret == 43 )); then
+            if select_monitoring_device "${dev_mode}"; then
+                target_dev="${VU_SELECTED_TARGET}"
+            fi
             continue
         fi
         break
@@ -5265,7 +5505,35 @@ PYEOF
 
 
 audio_visualizer_menu() {
+    local cur_mode="sink"
     while true; do
+        local def_sink
+        def_sink="$(pactl get-default-sink 2>/dev/null || pactl info 2>/dev/null | grep 'Default Sink' | cut -d: -f2 | xargs || true)"
+        local def_source
+        def_source="$(pactl get-default-source 2>/dev/null || pactl info 2>/dev/null | grep 'Default Source' | cut -d: -f2 | xargs || true)"
+
+        local target_node="${VU_SELECTED_TARGET:-}"
+        local target_desc=""
+        local mode_label=""
+        if [[ "$cur_mode" == "mic" ]]; then
+            [[ -z "$target_node" ]] && target_node="$def_source"
+            target_desc="$(_get_audio_device_desc "$target_node" "mic")"
+            [[ "$target_node" == "$def_source" ]] && target_desc="${target_desc} [По умолчанию]"
+            mode_label="ВХОД МИКРОФОНА (запись)"
+        else
+            [[ -z "$target_node" ]] && target_node="$def_sink"
+            target_desc="$(_get_audio_device_desc "$target_node" "sink")"
+            [[ "$target_node" == "$def_sink" ]] && target_desc="${target_desc} [По умолчанию]"
+            mode_label="ВЫХОД ЗВУКА (динамики / наушники)"
+        fi
+
+        local engine_info=""
+        if command -v python3 &>/dev/null; then
+            engine_info="Python 3 (интерактивный, горячие клавиши [T], [M], [D])"
+        else
+            engine_info="POSIX AWK (легковесный, без сторонних зависимостей)"
+        fi
+
         {
         print_banner
         log_title "ВИЗУАЛИЗАЦИЯ ЗВУКА И ДЕТЕКТОР АКТИВНОСТИ"
@@ -5273,35 +5541,60 @@ audio_visualizer_menu() {
         printf "  Позволяет объективно увидеть, подаётся ли сигнал на колонки или в микрофон.\n"
         printf "  Если шкала прыгает, а звука нет — проблема 100%% в физических колонках/штекере.\n\n"
 
+        printf "  ${C_BOLD}ТЕКУЩИЙ ИСТОЧНИК ДЛЯ АНАЛИЗА:${C_RESET}\n"
+        printf "    • Направление:   ${C_CYAN}%s${C_RESET}\n" "${mode_label}"
+        printf "    • Устройство:    ${C_GREEN}%s${C_RESET}\n" "${target_desc}"
+        printf "    • Системный узел: ${C_GRAY}%s${C_RESET}\n" "${target_node}"
+        printf "    • Движок:        %s\n\n" "${engine_info}"
+
         printf "  ${C_BOLD}[1]${C_RESET} 📊 ${C_BOLD}Запустить встроенный VU-метр & Детектор сигнала${C_RESET} ${C_GREEN}[Рекомендуется]${C_RESET}\n"
         _hint 'Зачем: показывает уровень сигнала (RMS и пик) в реальном времени прямо в терминале.'
         _hint 'Когда: подозрение, что звук идёт, но колонки выключены или выкручены в ноль.'
-        printf "  ${C_BOLD}[2]${C_RESET} 🌊 ${C_BOLD}Запустить CAVA (спектральный анализатор)${C_RESET}\n"
+        printf "  ${C_BOLD}[2]${C_RESET} 🔄 ${C_BOLD}Сменить аудиоустройство для анализа${C_RESET}\n"
+        _hint 'Зачем: позволяет выбрать конкретные колонки, наушники, HDMI или USB-ЦАП из списка.'
+        _hint 'Когда: в системе несколько аудиокарт или звук выводится не на дефолтное устройство.'
+        printf "  ${C_BOLD}[3]${C_RESET} 🎙️  ${C_BOLD}Переключить режим: Выход колонок ⟷ Микрофон${C_RESET}\n"
+        _hint 'Зачем: быстро переключает анализ между воспроизведением звука и записью с микрофона.'
+        _hint 'Когда: хотите проверить, слышит ли микрофон ваш голос или шум в комнате.'
+        printf "  ${C_BOLD}[4]${C_RESET} 🌊 ${C_BOLD}Запустить CAVA (спектральный анализатор)${C_RESET}\n"
         _hint 'Зачем: визуализирует спектр частот (басы, середина, верха).'
         _hint 'Когда: установлена утилита cava и хочется красивый частотный эквалайзер.'
-        printf "  ${C_BOLD}[3]${C_RESET} 📥 ${C_BOLD}Установить CAVA в систему${C_RESET}\n"
+        printf "  ${C_BOLD}[5]${C_RESET} 📥 ${C_BOLD}Установить CAVA в систему${C_RESET}\n"
         _hint 'Зачем: команда пакетного менеджера для установки утилиты cava.'
         _hint 'Когда: cava не найдена в системе.'
-        printf "  ${C_BOLD}[4]${C_RESET} 📡 ${C_BOLD}Слушать звук удаленно через SSH (Loopback)${C_RESET}\n"
+        printf "  ${C_BOLD}[6]${C_RESET} 📡 ${C_BOLD}Слушать звук удаленно через SSH (Loopback)${C_RESET}\n"
         _hint 'Зачем: перенаправляет звук с удалённого сервера на ваши колонки через SSH-туннель.'
         _hint 'Когда: администрируете чужой компьютер и хотите лично послушать его звук.'
         printf "  ${C_BOLD}[0]${C_RESET} 🔙 ${C_BOLD}Назад в главное меню${C_RESET}\n\n"
 
         } > "${MENU_BUF}" 2>&1
         local v_pick
-        menu_read v_pick "Твой выбор [0-4]: "
+        menu_read v_pick "Твой выбор [0-6]: "
         case "${v_pick}" in
-            1) run_terminal_vu_meter "monitor" || true ;;
+            1) run_terminal_vu_meter "${cur_mode}" "${target_node}" || true ;;
             2)
+                if select_monitoring_device "${cur_mode}"; then
+                    target_node="${VU_SELECTED_TARGET}"
+                fi
+                ;;
+            3)
+                if [[ "$cur_mode" == "mic" ]]; then
+                    cur_mode="sink"
+                else
+                    cur_mode="mic"
+                fi
+                VU_SELECTED_TARGET=""
+                ;;
+            4)
                 if command -v cava &>/dev/null; then
                     cava
                 else
                     log_warn "CAVA не установлена в системе."
-                    printf "  Установите пакет cava через пакетный менеджер (пункт [3]).\n\n"
+                    printf "  Установите пакет cava через пакетный менеджер (пункт [5]).\n\n"
                     press_enter
                 fi
                 ;;
-            3)
+            5)
                 print_banner
                 log_title "УСТАНОВКА CAVA"
                 printf "================================================================================\n\n"
@@ -5327,7 +5620,7 @@ audio_visualizer_menu() {
                 printf "\n"
                 press_enter
                 ;;
-            4)
+            6)
                 remote_session_menu
                 ;;
             0|q|Q) return ;;
@@ -6263,7 +6556,7 @@ EOF
             ;;
         --vu|--visualizer)
             IS_CLI_CALL=1
-            run_terminal_vu_meter "${2:-monitor}"
+            run_terminal_vu_meter "${2:-sink}" "${3:-}"
             exit 0
             ;;
         --stream-monitor)
