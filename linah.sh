@@ -11,7 +11,7 @@
 #  возвращает систему к умолчаниям.
 # ==============================================================================
 
-readonly LINAH_VERSION="1.0.0"
+readonly LINAH_VERSION="1.0.1"
 
 set -eo pipefail
 
@@ -694,7 +694,7 @@ show_diagnostics() {
 
                 if [[ -n "${card_info}" ]]; then
                     local act_profile
-                    act_profile="$(echo "${card_info}" | grep -E "Active Profile:" | awk -F': ' '{print $2}')"
+                    act_profile="$(echo "${card_info}" | grep -E "Active Profile:" | awk -F': ' '{print $2}' || true)"
                     local act_codec
                     act_codec="$(echo "${card_info}" | grep -E "bluetooth.codec" | awk -F'=' '{print $2}' | tr -d ' "' || echo 'SBC')"
 
@@ -703,7 +703,7 @@ show_diagnostics() {
                         printf "${C_GREEN}A2DP Стерео (Качественная музыка)${C_RESET}\n"
                     elif [[ "${act_profile}" =~ headset|handsfree|hsp|hfp ]]; then
                         printf "${C_RED}HSP/HFP Моно-гарнитура (Голос из унитаза/микрофонный режим!)${C_RESET}\n"
-                        printf "       │  ${C_YELLOW}👉 Срочно переключай на A2DP в пункте меню [3]!${C_RESET}\n"
+                        printf "       │  ${C_YELLOW}👉 Срочно переключай на A2DP в пункте меню [5] или [7]!${C_RESET}\n"
                     else
                         printf "${C_WHITE}%s${C_RESET}\n" "${act_profile}"
                     fi
@@ -726,10 +726,10 @@ show_diagnostics() {
                         printf "${C_GREEN}ОТКЛЮЧЕНА (Сигнал отдаётся на 100%%)${C_RESET}\n"
                     elif [[ "${card_info}" =~ "bluez5.hw-volume = true" || "${card_info}" =~ "volume_exists = true" ]]; then
                         printf "${C_YELLOW}Синхронизируется по AVRCP${C_RESET}\n"
-                        printf "          ${C_DIM}Если на наушниках есть кнопки [+] [-], нажми [+] 15 раз до упора. Если только колёсико — примени нативный фикс [2]!${C_RESET}\n"
+                        printf "          ${C_DIM}Если на наушниках есть кнопки [+] [-], нажми [+] 15 раз до упора. Если только колёсико — примени нативный фикс [4]!${C_RESET}\n"
                     else
                         printf "${C_RED}ПОТЕНЦИАЛЬНЫЙ ЛОК (WirePlumber душит поток)${C_RESET}\n"
-                        printf "          ${C_YELLOW}👉 Рекомендуется нативный фикс WirePlumber (пункт меню [2], вариант 1)!${C_RESET}\n"
+                        printf "          ${C_YELLOW}👉 Рекомендуется нативный фикс WirePlumber (пункт меню [4], вариант 1)!${C_RESET}\n"
                     fi
                 fi
             done <<< "${bt_devs}"
@@ -745,7 +745,7 @@ show_diagnostics() {
             if [[ -d "${CINNAMON_USER_APPLET}" ]]; then
                 printf "    ├─ Статус ползунка: ${C_GREEN}Модифицирован (разлочен выше 150%%)${C_RESET}\n"
             else
-                printf "    ├─ Статус ползунка: ${C_YELLOW}Стандартный (лимит 150%%). Разлочка: пункт [5]${C_RESET}\n"
+                printf "    ├─ Статус ползунка: ${C_YELLOW}Стандартный (лимит 150%%). Разлочка: пункт [9]${C_RESET}\n"
             fi
             ;;
         kde)
@@ -850,7 +850,9 @@ setup_preamp_boost() {
         done
         } > "${MENU_BUF}" 2>&1
         menu_read c_idx "Номер устройства: "
-        target_sink="${bt_sinks[$((c_idx-1))]:-}"
+        if [[ "${c_idx}" =~ ^[0-9]+$ && "${c_idx}" -ge 1 && "${c_idx}" -le "${#bt_sinks[@]}" ]]; then
+            target_sink="${bt_sinks[$((c_idx-1))]}"
+        fi
     fi
 
     if [[ -z "${target_sink}" ]]; then
@@ -884,6 +886,7 @@ setup_preamp_boost() {
         4)
             read -r -p "Введи число от 1.5 до 5.0: " user_mult
             mult="${user_mult:-3.0}"
+            mult="${mult//,/.}"
             ;;
         *) mult="3.0" ;;
     esac
@@ -1041,18 +1044,18 @@ fix_quiet_bluetooth() {
         menu_read b_choice "Твой выбор [0-5]: "
         case "${b_choice}" in
             1)
-                apply_native_wp_fix 1
+                apply_native_wp_fix 1 || true
                 press_enter
                 ;;
             2)
-                setup_preamp_boost
+                setup_preamp_boost || true
                 ;;
             3)
-                remove_native_wp_fix
+                remove_native_wp_fix || true
                 press_enter
                 ;;
             4)
-                disable_preamp_boost
+                disable_preamp_boost || true
                 press_enter
                 ;;
             5)
@@ -1099,7 +1102,7 @@ fix_codecs_and_profiles() {
         local card_raw
         card_raw="$(LC_ALL=C pactl list cards 2>/dev/null | grep -A 120 "Name: ${card}" || true)"
         local cur_profile
-        cur_profile="$(echo "${card_raw}" | grep -E "Active Profile:" | awk -F': ' '{print $2}')"
+        cur_profile="$(echo "${card_raw}" | grep -E "Active Profile:" | awk -F': ' '{print $2}' || true)"
         printf "  Текущий профиль: ${C_CYAN}%s${C_RESET}\n\n" "${cur_profile}"
 
         printf "  ${C_BOLD}Что делаем?${C_RESET}\n"
@@ -1178,7 +1181,8 @@ _journal_boots() {
 # Собрать метрики одной загрузки: "BUSY HFP SCO SEP OK"
 _boot_bt_metrics() {
     local b="$1" log
-    log="$(journalctl -b "${b}" --no-pager 2>/dev/null || true)"
+    log="$(journalctl -b "${b}" -u bluetooth --user -u pipewire --user -u wireplumber -k --no-pager 2>/dev/null || true)"
+    [[ -z "${log}" ]] && log="$(journalctl -b "${b}" --no-pager 2>/dev/null || true)"
     local busy hfp sco sep ok
     busy="$(_count_matches 'a2dp-sink profile connect failed.*resource busy' "${log}")"
     hfp="$(_count_matches 'Hands-Free Voice gateway' "${log}")"
@@ -1430,7 +1434,7 @@ bt_clean_reconnect() {
     done
     sleep 1
 
-    bt_verify_state
+    bt_verify_state || true
 }
 
 # --- Проверка: реально ли мы в стерео A2DP ---
@@ -1572,11 +1576,11 @@ fix_bt_profile_race() {
                 press_enter
                 ;;
             5)
-                remove_roles_tweak
+                remove_roles_tweak || true
                 press_enter
                 ;;
             6)
-                remove_multiprofile_tweak
+                remove_multiprofile_tweak || true
                 press_enter
                 ;;
             0|q|Q)
@@ -1774,7 +1778,7 @@ check_server_conflict() {
 
 check_pulse_bridge() {
     if _is_pipewire && ! _is_pulse_native; then
-        if ! systemctl --user is-active pipewire-pulse &>/dev/null && ! _have pactl; then
+        if ! systemctl --user is-active pipewire-pulse &>/dev/null; then
             add_finding WARN \
                 "Нет моста pipewire-pulse" \
                 "Приложения, умеющие только PulseAudio (браузеры, Telegram, Steam), останутся без звука." \
@@ -2078,7 +2082,7 @@ check_bt_race_history() {
     _have journalctl || return 0
     _bt_has_paired || return 0
     local recent=0 total=0 b m busy hfp sco sep ok
-    for b in $(_journal_boots); do
+    for b in $(_journal_boots | tail -n 10); do
         m="$(_boot_bt_metrics "${b}")"
         read -r busy hfp sco sep ok <<< "${m}"
         total=$(( total + busy + sco ))
@@ -2616,7 +2620,7 @@ _offer_fixes() {
     printf "\n"
     local yn
     read -r -p "  Подтвердить? [y/N]: " yn
-    [[ "${yn}" =~ ^[yYдД]$ ]] || { log_info "Отменено."; press_enter; return; }
+    [[ "${yn}" =~ ^[yYдД] ]] || { log_info "Отменено."; press_enter; return; }
 
     printf "\n"
     local applied=0 failed=0 fn
@@ -2741,12 +2745,11 @@ fix_switch_sink() {
     local pick
     } > "${MENU_BUF}" 2>&1
     menu_read pick "  Куда гоним звук? [1-$(( i - 1 ))]: "
-    [[ "${pick}" =~ ^[0-9]+$ ]] || { log_warn "Пропускаю."; return 1; }
-    local target="${sinks[$(( pick - 1 ))]:-}"
-    [[ -z "${target}" ]] && { log_warn "Такого номера нет."; return 1; }
+    [[ "${pick}" =~ ^[0-9]+$ && "${pick}" -ge 1 && "${pick}" -le "${#sinks[@]}" ]] || { log_warn "Такого номера нет."; return 1; }
+    local target="${sinks[$(( pick - 1 ))]}"
 
     pactl set-default-sink "${target}" 2>/dev/null || true
-    fix_move_streams
+    fix_move_streams || true
     log_cool "Выход по умолчанию: ${target}"
     return 0
 }
@@ -3045,7 +3048,7 @@ fix_install_bt_codecs() {
     printf "\n  Команда установки: ${C_BOLD}%s${C_RESET}\n" "${cmd}"
     local yn
     read -r -p "  Выполнить? [y/N]: " yn
-    [[ "${yn}" =~ ^[yYдД]$ ]] || { log_info "Пропускаю."; return 0; }
+    [[ "${yn}" =~ ^[yYдД] ]] || { log_info "Пропускаю."; return 0; }
     eval "${cmd}" || { log_danger "Установка не удалась."; return 1; }
 
     log_info "Перезапускаю WirePlumber и переподключаю гарнитуру, иначе новые кодеки не появятся..."
@@ -3339,9 +3342,8 @@ _bt_pick_device() {
     local pick
     } > "${MENU_BUF}" 2>&1
     menu_read pick "  Номер [1-$(( i - 1 ))]: "
-    [[ "${pick}" =~ ^[0-9]+$ ]] || return 1
-    local sel="${list[$(( pick - 1 ))]:-}"
-    [[ -z "${sel}" ]] && return 1
+    [[ "${pick}" =~ ^[0-9]+$ && "${pick}" -ge 1 && "${pick}" -le "${#list[@]}" ]] || return 1
+    local sel="${list[$(( pick - 1 ))]}"
     echo "${sel%%|*}"
 }
 
@@ -3407,7 +3409,7 @@ _bt_decode_sbc() {  # _bt_decode_sbc "4 17 21 2 53"
     read -r -a b <<< "${raw}" || true
     # busctl печатает массив как "<длина> <байт> <байт>..."
     local n="${b[0]}"
-    [[ "${n}" -ne 4 || ${#b[@]} -lt 5 ]] && { printf "     не SBC или неожиданный формат: %s\n" "${raw}"; return 1; }
+    [[ "${n}" -ne 4 || ${#b[@]} -lt 5 ]] && { printf "     не SBC или неожиданный формат: %s\n" "${raw}"; return 0; }
     local b0="${b[1]}" b1="${b[2]}" minbp="${b[3]}" maxbp="${b[4]}"
 
     local fb=$(( b0 >> 4 )) cb=$(( b0 & 15 ))
@@ -3463,7 +3465,7 @@ bt_show_capabilities() {
     printf "  ${C_BOLD}Путь D-Bus:${C_RESET} %s\n\n" "${dev}"
 
     local ifaces
-    ifaces="$(busctl introspect org.bluez "${dev}" 2>/dev/null | awk '/^org\.bluez/{print $1}')"
+    ifaces="$(busctl introspect org.bluez "${dev}" 2>/dev/null | awk '/^org\.bluez/{print $1}' || true)"
     printf "  ${C_BOLD}Доступные интерфейсы:${C_RESET}\n"
     if [[ -z "${ifaces}" ]]; then
         printf "    ${C_RED}нет (устройство отключено?)${C_RESET}\n"
@@ -3509,7 +3511,7 @@ bt_show_capabilities() {
         local delay; delay="$(_bt_prop "${tr}" org.bluez.MediaTransport1 Delay)"
         [[ -n "${delay}" && "${delay}" != "-" ]] && printf "    Задержка:   %s ${C_DIM}(в 1/10 мс)${C_RESET}\n" "${delay}"
         printf "\n  ${C_BOLD}Кодек:${C_RESET}\n"
-        _bt_decode_sbc "$(_bt_prop "${tr}" org.bluez.MediaTransport1 Configuration)"
+        _bt_decode_sbc "$(_bt_prop "${tr}" org.bluez.MediaTransport1 Configuration)" || true
     else
         printf "\n  ${C_YELLOW}Медиа-транспорт не найден — включи воспроизведение и повтори.${C_RESET}\n"
     fi
@@ -3564,15 +3566,15 @@ bt_volume_menu() {
         } > "${MENU_BUF}" 2>&1
         menu_read c "Выбор [0-5]: "
         case "${c}" in
-            1) printf "\n"; _bt_avrcp_burst "${dev}" VolumeUp 25 0.3; press_enter ;;
+            1) printf "\n"; _bt_avrcp_burst "${dev}" VolumeUp 25 0.3 || true; press_enter ;;
             2) read -r -p "  Сколько шагов вверх? [1-50]: " n
-               [[ "${n}" =~ ^[0-9]+$ ]] && { printf "\n"; _bt_avrcp_burst "${dev}" VolumeUp "${n}" 0.3; }
+               [[ "${n}" =~ ^[0-9]+$ ]] && { printf "\n"; _bt_avrcp_burst "${dev}" VolumeUp "${n}" 0.3 || true; }
                press_enter ;;
             3) read -r -p "  Сколько шагов вниз? [1-50]: " n
-               [[ "${n}" =~ ^[0-9]+$ ]] && { printf "\n"; _bt_avrcp_burst "${dev}" VolumeDown "${n}" 0.3; }
+               [[ "${n}" =~ ^[0-9]+$ ]] && { printf "\n"; _bt_avrcp_burst "${dev}" VolumeDown "${n}" 0.3 || true; }
                press_enter ;;
-            4) bt_set_absolute_volume "${tr}"; press_enter ;;
-            5) bt_test_reversibility "${dev}"; press_enter ;;
+            4) bt_set_absolute_volume "${tr}" || true; press_enter ;;
+            5) bt_test_reversibility "${dev}" || true; press_enter ;;
             0|q|Q) return ;;
             *) log_warn "Неверный выбор."; sleep 1 ;;
         esac
@@ -3710,12 +3712,12 @@ bt_connection_menu() {
         } > "${MENU_BUF}" 2>&1
         menu_read c "Выбор [0-7]: "
         case "${c}" in
-            1) timeout 25 bluetoothctl connect "${mac}" 2>&1 | tail -1; sleep 2 ;;
-            2) timeout 15 bluetoothctl disconnect "${mac}" 2>&1 | tail -1; sleep 2 ;;
+            1) timeout 25 bluetoothctl connect "${mac}" 2>&1 | tail -1 || true; sleep 2 ;;
+            2) timeout 15 bluetoothctl disconnect "${mac}" 2>&1 | tail -1 || true; sleep 2 ;;
             3) _bt_connect_profile "${dev}" "${UUID_A2DP_SINK}" "стерео A2DP" ;;
             4) _bt_disconnect_profile "${dev}" "${UUID_HFP}" "телефонный HFP" ;;
             5) _bt_connect_profile "${dev}" "${UUID_AVRCP}" "пульт AVRCP" ;;
-            6) timeout 10 bluetoothctl trust "${mac}" >/dev/null 2>&1 && log_cool "Помечено доверенным." ;;
+            6) timeout 10 bluetoothctl trust "${mac}" >/dev/null 2>&1 && log_cool "Помечено доверенным." || log_danger "Не удалось пометить доверенным." ;;
             7) bt_clean_reconnect || true ;;
             0|q|Q) return ;;
             *) log_warn "Неверный выбор."; sleep 1; continue ;;
@@ -3816,11 +3818,11 @@ PYEOF
 _play_to() {  # _play_to <sink> <файл> [таймаут]
     local sink="$1" f="$2" t="${3:-10}"
     if command -v pw-play &>/dev/null; then
-        timeout "${t}" pw-play --target="${sink}" "${f}" >/dev/null 2>&1
+        timeout "${t}" pw-play --target="${sink}" "${f}" >/dev/null 2>&1 || true
     elif command -v paplay &>/dev/null; then
-        timeout "${t}" paplay -d "${sink}" "${f}" >/dev/null 2>&1
+        timeout "${t}" paplay -d "${sink}" "${f}" >/dev/null 2>&1 || true
     else
-        timeout "${t}" aplay -q "${f}" >/dev/null 2>&1
+        timeout "${t}" aplay -q "${f}" >/dev/null 2>&1 || true
     fi
 }
 
@@ -3905,17 +3907,17 @@ bt_test_reversibility() {
 
     sleep 6
     printf "  ${C_YELLOW}▼ опускаю регистр гарнитуры${C_RESET}\n"
-    _bt_avrcp_burst "${dev}" VolumeDown 20 0.4
+    _bt_avrcp_burst "${dev}" VolumeDown 20 0.4 || true
     sleep 3
     printf "  ${C_GREEN}▲ поднимаю обратно${C_RESET}\n"
-    _bt_avrcp_burst "${dev}" VolumeUp 25 0.4
+    _bt_avrcp_burst "${dev}" VolumeUp 25 0.4 || true
     sleep 2
     kill "${pid}" 2>/dev/null
-    wait "${pid}" 2>/dev/null
+    wait "${pid}" 2>/dev/null || true
 
     printf "\n  Громкость системы в конце: "
     LC_ALL=C pactl list sinks 2>/dev/null | sed -n "/Name: ${sink}/,/^\$/p" \
-        | grep -m1 'Volume: front' | sed 's/.*Volume: *//'
+        | grep -m1 'Volume: front' | sed 's/.*Volume: *//' || true
     printf "\n"
     printf "  ${C_BOLD}Если звук ушёл в тишину и вернулся${C_RESET} — причина доказана:\n"
     printf "  дело в регистре гарнитуры, а не в настройках Linux.\n\n"
@@ -3941,7 +3943,7 @@ bt_test_bitrate() {
     if [[ -r "${ctr}" ]]; then
         a="$(cat "${ctr}")"
     elif command -v hciconfig &>/dev/null; then
-        a="$(hciconfig "${hci}" 2>/dev/null | grep -oE 'TX bytes:[0-9]+' | grep -oE '[0-9]+')"
+        a="$(hciconfig "${hci}" 2>/dev/null | grep -oE 'TX bytes:[0-9]+' | grep -oE '[0-9]+' || echo 0)"
     else
         log_danger "Нечем считать переданные байты (нет счётчика и hciconfig)."
         press_enter; return 1
@@ -3953,7 +3955,7 @@ bt_test_bitrate() {
     _play_to "${sink}" "${TONE_DIR}/t20.wav" 10
     t1="$(date +%s%N)"
     if [[ -r "${ctr}" ]]; then b="$(cat "${ctr}")"; else
-        b="$(hciconfig "${hci}" 2>/dev/null | grep -oE 'TX bytes:[0-9]+' | grep -oE '[0-9]+')"; fi
+        b="$(hciconfig "${hci}" 2>/dev/null | grep -oE 'TX bytes:[0-9]+' | grep -oE '[0-9]+' || echo 0)"; fi
 
     local bytes=$(( b - a ))
     local ms=$(( (t1 - t0) / 1000000 ))
@@ -3966,7 +3968,7 @@ bt_test_bitrate() {
     local tr; tr="$(_bt_transport_path)"
     if [[ -n "${tr}" ]]; then
         printf "  ${C_BOLD}Согласованный кодек:${C_RESET}\n"
-        _bt_decode_sbc "$(_bt_prop "${tr}" org.bluez.MediaTransport1 Configuration)"
+        _bt_decode_sbc "$(_bt_prop "${tr}" org.bluez.MediaTransport1 Configuration)" || true
         printf "\n"
     fi
     if [[ "${kbps}" -lt 100 ]]; then
@@ -4005,7 +4007,7 @@ bt_test_chain() {
 
     printf "\n  ${C_BOLD}[2] Узел-выход${C_RESET}\n"
     LC_ALL=C pactl list sinks 2>/dev/null | sed -n "/Name: ${sink}/,/^\$/p" \
-        | grep -E 'Volume: front|Base Volume|Mute:|Flags:' | sed 's/^/      /'
+        | grep -E 'Volume: front|Base Volume|Mute:|Flags:' | sed 's/^/      /' || true
 
     printf "\n  ${C_BOLD}[3] Маршрут устройства${C_RESET} ${C_DIM}(применяется после узла)${C_RESET}\n"
     if command -v pw-dump &>/dev/null && command -v python3 &>/dev/null; then
@@ -4035,9 +4037,9 @@ for o in data:
 
     printf "\n  ${C_BOLD}[4] Профиль и кодек${C_RESET}\n"
     [[ -n "${card}" ]] && LC_ALL=C pactl list cards 2>/dev/null \
-        | sed -n "/Name: ${card}/,/^Card #/p" | grep 'Active Profile' | sed 's/^/      /'
+        | sed -n "/Name: ${card}/,/^Card #/p" | grep 'Active Profile' | sed 's/^/      /' || true
     LC_ALL=C pactl list sinks 2>/dev/null | sed -n "/Name: ${sink}/,/^\$/p" \
-        | grep -E 'api.bluez5.codec' | sed 's/^/      /'
+        | grep -E 'api.bluez5.codec' | sed 's/^/      /' || true
 
     printf "\n  ${C_BOLD}[5] Транспорт BlueZ${C_RESET}\n"
     local tr; tr="$(_bt_transport_path)"
@@ -4045,12 +4047,12 @@ for o in data:
         printf "      состояние: %s\n" "$(_bt_prop "${tr}" org.bluez.MediaTransport1 State)"
         local v; v="$(_bt_prop "${tr}" org.bluez.MediaTransport1 Volume)"
         printf "      AVRCP Volume: %s\n" "${v:-не задан}"
-        _bt_decode_sbc "$(_bt_prop "${tr}" org.bluez.MediaTransport1 Configuration)"
+        _bt_decode_sbc "$(_bt_prop "${tr}" org.bluez.MediaTransport1 Configuration)" || true
     else
         printf "      (транспорт не найден)\n"
     fi
 
-    kill "${pid}" 2>/dev/null; wait "${pid}" 2>/dev/null
+    kill "${pid}" 2>/dev/null; wait "${pid}" 2>/dev/null || true
 
     printf "\n================================================================================\n"
     printf "  ${C_BOLD}Как читать:${C_RESET} если все четыре точки показывают 100%% / 1.0 / 0.00 dB,\n"
@@ -4072,9 +4074,9 @@ bt_test_link() {
 
     if command -v hcitool &>/dev/null; then
         printf "  ${C_BOLD}Активные соединения:${C_RESET}\n"
-        hcitool con 2>/dev/null | sed 's/^/    /'
+        hcitool con 2>/dev/null | sed 's/^/    /' || true
         local handle
-        handle="$(hcitool con 2>/dev/null | grep -i "${mac}" | grep -oE 'handle [0-9]+' | awk '{print $2}')"
+        handle="$(hcitool con 2>/dev/null | grep -i "${mac}" | grep -oE 'handle [0-9]+' | awk '{print $2}' || true)"
         if [[ -n "${handle}" ]]; then
             printf "\n  ${C_BOLD}RSSI:${C_RESET}    %s\n" "$(hcitool rssi "${mac}" 2>/dev/null | sed 's/.*: //' || echo '?')"
             printf "  ${C_BOLD}Мощность:${C_RESET} %s\n" "$(hcitool tpl "${mac}" 2>/dev/null | sed 's/.*: //' || echo '?')"
@@ -4143,11 +4145,11 @@ bt_remote_menu() {
         } > "${MENU_BUF}" 2>&1
         menu_read c "Выбор [0-5]: "
         case "${c}" in
-            1) bt_volume_menu ;;
-            2) bt_playback_menu ;;
-            3) bt_connection_menu ;;
-            4) bt_delay_menu ;;
-            5) bt_show_capabilities ;;
+            1) bt_volume_menu || true ;;
+            2) bt_playback_menu || true ;;
+            3) bt_connection_menu || true ;;
+            4) bt_delay_menu || true ;;
+            5) bt_show_capabilities || true ;;
             0|q|Q) return ;;
             *) log_warn "Неверный выбор."; sleep 1 ;;
         esac
@@ -4186,11 +4188,11 @@ bt_test_menu() {
         } > "${MENU_BUF}" 2>&1
         menu_read c "Выбор [0-5]: "
         case "${c}" in
-            1) bt_test_tone_ladder ;;
-            2) bt_test_reversibility; press_enter ;;
-            3) bt_test_chain ;;
-            4) bt_test_bitrate ;;
-            5) bt_test_link ;;
+            1) bt_test_tone_ladder || true ;;
+            2) bt_test_reversibility || true; press_enter ;;
+            3) bt_test_chain || true ;;
+            4) bt_test_bitrate || true ;;
+            5) bt_test_link || true ;;
             0|q|Q) return ;;
             *) log_warn "Неверный выбор."; sleep 1 ;;
         esac
@@ -4275,26 +4277,32 @@ tune_volume_menu() {
     } > "${MENU_BUF}" 2>&1
     menu_read v_act "Твой выбор: "
     case "${v_act}" in
-        1) pactl set-sink-volume "${sel_name}" 100% && log_cool "Громкость 100% установлена!" ;;
-        2) pactl set-sink-volume "${sel_name}" 150% && log_cool "Громкость 150% установлена!" ;;
-        3) pactl set-sink-volume "${sel_name}" 200% && log_cool "Громкость 200% установлена!" ;;
+        1) pactl set-sink-volume "${sel_name}" 100% 2>/dev/null && log_cool "Громкость 100% установлена!" || log_danger "Не удалось установить громкость." ;;
+        2) pactl set-sink-volume "${sel_name}" 150% 2>/dev/null && log_cool "Громкость 150% установлена!" || log_danger "Не удалось установить громкость." ;;
+        3) pactl set-sink-volume "${sel_name}" 200% 2>/dev/null && log_cool "Громкость 200% установлена!" || log_danger "Не удалось установить громкость." ;;
         4)
             read -r -p "Введи процент (число): " custom_pct
             custom_pct="${custom_pct//%/}"
             if [[ "${custom_pct}" =~ ^[0-9]+$ ]]; then
-                pactl set-sink-volume "${sel_name}" "${custom_pct}%"
-                log_cool "Громкость ${custom_pct}% установлена!"
+                if pactl set-sink-volume "${sel_name}" "${custom_pct}%" 2>/dev/null; then
+                    log_cool "Громкость ${custom_pct}% установлена!"
+                else
+                    log_danger "Не удалось установить громкость."
+                fi
             else
                 log_danger "Ты ввел не число, чувак."
             fi
             ;;
         5)
-            pactl set-sink-mute "${sel_name}" toggle
+            pactl set-sink-mute "${sel_name}" toggle 2>/dev/null || true
             log_cool "Mute переключен!"
             ;;
         6)
-            pactl set-default-sink "${sel_name}"
-            log_cool "Устройство назначено главным по умолчанию!"
+            if pactl set-default-sink "${sel_name}" 2>/dev/null; then
+                log_cool "Устройство назначено главным по умолчанию!"
+            else
+                log_danger "Не удалось назначить устройство выходом по умолчанию."
+            fi
             ;;
         *) ;;
     esac
@@ -4336,7 +4344,8 @@ tune_cinnamon() {
                 custom_val="${custom_val//%/}"
                 if [[ "${custom_val}" =~ ^[0-9]+$ && "${custom_val}" -ge 150 ]]; then
                     pct="${custom_val}"
-                    mult="$(awk "BEGIN {printf \"%.1f\", ${pct} / 100}")"
+                    mult="$(LC_ALL=C awk "BEGIN {printf \"%.1f\", ${pct} / 100}")"
+                    mult="${mult//,/.}"
                 else
                     log_danger "Некорректное число."
                     return
@@ -4673,22 +4682,7 @@ restart_audio_stack() {
 # ==============================================================================
 # 8. ПОЛНЫЙ СБРОС В ЗАВОД: «ВЕРНУТЬ ВСЁ ВЗАД, КАК БЫЛО»
 # ==============================================================================
-factory_revert() {
-    print_banner
-    log_title "ПОЛНЫЙ ОТКАТ ВСЕХ ТВphases И МОДИФИКАЦИЙ"
-    printf "================================================================================\n\n"
-
-    printf "  ${C_RED}${C_BOLD}ВНИМАНИЕ!${C_RESET}\n"
-    printf "  Это снесёт все созданные виртуальные усилители, вернёт ползунок в трее к стандарту,\n"
-    printf "  сбросит громкость на чистые 100%% и перезапустит звук в кристально чистом виде.\n\n"
-
-    read -r -p "Ты абсолютно уверен, что хочешь всё сбросить? [y/N]: " confirm
-    if [[ ! "${confirm}" =~ ^[yYдД] ]]; then
-        log_info "Сброс отменён. Ничего не трогаем."
-        press_enter
-        return
-    fi
-
+_do_factory_revert() {
     log_info "1. Сносим конфиги PipeWire, созданные linah..."
     rm -f "${PREAMP_CONF}" "${LEGACY_PREAMP_CONF}"
     rm -f "$(_pw_conf_dir)"/99-linah-*.conf "$(_pw_conf_dir)"/99-audio-boss-*.conf
@@ -4715,20 +4709,20 @@ factory_revert() {
                  /etc/modprobe.d/99-audio-boss-hda.conf \
                  /etc/udev/rules.d/99-audio-boss-bt-nosuspend.rules \
                  /etc/security/limits.d/99-audio-boss-rt.conf; do
-        if sudo test -f "${_sysf}" 2>/dev/null; then
-            sudo rm -f "${_sysf}" && log_info "   удалён ${_sysf}"
+        if test -f "${_sysf}" 2>/dev/null; then
+            sudo rm -f "${_sysf}" 2>/dev/null && log_info "   удалён ${_sysf}" || true
         fi
     done
     local _bak
     for _bak in "${BT_MAIN_CONF}.linah.bak" "${BT_MAIN_CONF}.audio-boss.bak"; do
-      if sudo test -f "${_bak}" 2>/dev/null; then
+      if test -f "${_bak}" 2>/dev/null; then
         sudo cp -a "${_bak}" "${BT_MAIN_CONF}" 2>/dev/null || true
         sudo rm -f "${_bak}" 2>/dev/null || true
         log_info "   ${_bak} → ${BT_MAIN_CONF} возвращён"
         sudo systemctl restart bluetooth 2>/dev/null || true
       fi
     done
-    sudo udevadm control --reload-rules 2>/dev/null || true
+    sudo -n udevadm control --reload-rules 2>/dev/null || true
 
     log_info "3. Сносим кастомные настройки графических сред..."
     if [[ -d "${CINNAMON_USER_APPLET}" ]]; then
@@ -4760,6 +4754,25 @@ factory_revert() {
         pactl set-sink-volume "${alsa_sink}" 100% 2>/dev/null || true
         pactl set-sink-mute "${alsa_sink}" 0 2>/dev/null || true
     fi
+}
+
+factory_revert() {
+    print_banner
+    log_title "ПОЛНЫЙ ОТКАТ ВСЕХ ТВИКОВ И МОДИФИКАЦИЙ"
+    printf "================================================================================\n\n"
+
+    printf "  ${C_RED}${C_BOLD}ВНИМАНИЕ!${C_RESET}\n"
+    printf "  Это снесёт все созданные виртуальные усилители, вернёт ползунок в трее к стандарту,\n"
+    printf "  сбросит громкость на чистые 100%% и перезапустит звук в кристально чистом виде.\n\n"
+
+    read -r -p "Ты абсолютно уверен, что хочешь всё сбросить? [y/N]: " confirm
+    if [[ ! "${confirm}" =~ ^[yYдД] ]]; then
+        log_info "Сброс отменён. Ничего не трогаем."
+        press_enter
+        return
+    fi
+
+    _do_factory_revert
 
     log_cool "СИСТЕМА ПОЛНОСТЬЮ СБРОШЕНА В ЗАВОДСКОЙ СТАНДАРТ!"
     printf "  Твой звук чист, как слеза младенца. Никаких хвостов и скрытых демонов.\n"
@@ -4778,9 +4791,10 @@ handle_cli() {
             ;;
         --preamp-on)
             local mult="${2:-3.0}"
+            mult="${mult//,/.}"
             local target
             target="$(LC_ALL=C pactl list short sinks 2>/dev/null | awk '$2 ~ /^bluez_output/ {print $2}' | head -n1 || true)"
-            [[ -z "${target}" ]] && target="$(pactl get-default-sink 2>/dev/null)"
+            [[ -z "${target}" ]] && target="$(pactl get-default-sink 2>/dev/null || true)"
 
             mkdir -p "${PW_CONF_DIR}"
             cat << EOF > "${PREAMP_CONF}"
@@ -4840,7 +4854,7 @@ EOF
             audio_first_aid_kit
             exit 0
             ;;
-        --remote|--pult)
+        --remote|--pult|--bt-remote)
             IS_CLI_CALL=1
             bt_remote_menu
             exit 0
@@ -4897,9 +4911,7 @@ EOF
             exit 0
             ;;
         --revert)
-            rm -f "${PREAMP_CONF}" "${LEGACY_PREAMP_CONF}"
-            rm -rf "${CINNAMON_USER_APPLET}"
-            systemctl --user restart pipewire wireplumber pipewire-pulse 2>/dev/null || true
+            _do_factory_revert
             log_cool "Полный откат выполнен."
             exit 0
             ;;
@@ -4910,7 +4922,8 @@ EOF
             case "${de}" in
                 cinnamon)
                     local mult
-                    mult="$(awk "BEGIN {printf \"%.1f\", ${pct} / 100}")"
+                    mult="$(LC_ALL=C awk "BEGIN {printf \"%.1f\", ${pct} / 100}")"
+                    mult="${mult//,/.}"
                     gsettings set org.cinnamon.desktop.sound allow-amplified-volume true 2>/dev/null || true
                     mkdir -p "$(dirname "${CINNAMON_USER_APPLET}")"
                     [[ ! -d "${CINNAMON_USER_APPLET}" ]] && cp -r "${CINNAMON_SYS_APPLET}" "${CINNAMON_USER_APPLET}"
@@ -4964,13 +4977,13 @@ EOF
                     log_cool "MATE: оверамплификация 150% включена."
                     ;;
                 *)
-                    log_warn "Окружение не определено для автоматической разлочки. Запусти скрипт без аргументов и выбери пункт [5]."
+                    log_warn "Окружение не определено для автоматической разлочки. Запусти скрипт без аргументов и выбери пункт [9]."
                     ;;
             esac
             exit 0
             ;;
         --fix-bt-native)
-            apply_native_wp_fix 1
+            apply_native_wp_fix 1 || true
             exit 0
             ;;
         --fix-bt-native-revert)
@@ -5135,20 +5148,20 @@ main() {
         } > "${MENU_BUF}" 2>&1
         menu_read choice "Введи номер пункта [0-14]: "
         case "${choice}" in
-            1) run_full_analysis ;;
-            2) audio_first_aid_kit ;;
-            3) show_diagnostics ;;
-            4) fix_quiet_bluetooth ;;
-            5) fix_bt_profile_race ;;
-            6) bt_race_forensics ;;
-            7) fix_codecs_and_profiles ;;
-            8) tune_volume_menu ;;
-            9) tune_desktop_slider ;;
-            10) run_sound_test ;;
-            11) restart_audio_stack ;;
-            12) factory_revert ;;
-            13) bt_remote_menu ;;
-            14) bt_test_menu ;;
+            1) run_full_analysis || true ;;
+            2) audio_first_aid_kit || true ;;
+            3) show_diagnostics || true ;;
+            4) fix_quiet_bluetooth || true ;;
+            5) fix_bt_profile_race || true ;;
+            6) bt_race_forensics || true ;;
+            7) fix_codecs_and_profiles || true ;;
+            8) tune_volume_menu || true ;;
+            9) tune_desktop_slider || true ;;
+            10) run_sound_test || true ;;
+            11) restart_audio_stack || true ;;
+            12) factory_revert || true ;;
+            13) bt_remote_menu || true ;;
+            14) bt_test_menu || true ;;
             0|q|Q)
                 printf "\n${C_GREEN}Бывай, бро! Если звук опять заартачится — ты знаешь, где меня найти.${C_RESET}\n\n"
                 exit 0
