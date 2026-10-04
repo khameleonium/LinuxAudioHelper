@@ -5025,6 +5025,7 @@ remote_session_menu() {
 run_terminal_vu_meter() {
     if ! command -v python3 &>/dev/null; then
         log_danger "Для работы терминального VU-метра требуется python3."
+        press_enter
         return 1
     fi
 
@@ -5038,20 +5039,26 @@ run_terminal_vu_meter() {
         def_source="$(pactl get-default-source 2>/dev/null || pactl info 2>/dev/null | grep 'Default Source' | cut -d: -f2 | xargs || true)"
 
         if [[ "${dev_mode}" == "mic" ]]; then
-            target_name="Микрофон: ${def_source:-@DEFAULT_SOURCE@}"
-            if command -v pw-record &>/dev/null && [[ -n "$def_source" ]]; then
-                cap_cmd="pw-record --target ${def_source} --rate 16000 --channels 2 --format s16 -"
+            local src_target="${def_source:-@DEFAULT_AUDIO_SOURCE@}"
+            target_name="Микрофон: ${src_target}"
+            if command -v pw-record &>/dev/null; then
+                cap_cmd="pw-record --target \"${src_target}\" --rate 16000 --channels 2 --format s16 -"
             elif command -v parec &>/dev/null; then
-                cap_cmd="parec -d ${def_source} --rate=16000 --channels=2 --format=s16le"
+                local p_arg=""
+                [[ -n "${def_source}" ]] && p_arg="-d \"${def_source}\""
+                cap_cmd="parec ${p_arg} --rate=16000 --channels=2 --format=s16le"
             elif command -v ffmpeg &>/dev/null; then
                 cap_cmd="ffmpeg -v quiet -f pulse -i default -f s16le -ac 2 -ar 16000 -"
             fi
         else
-            target_name="Монитор колонок: ${def_sink:-@DEFAULT_SINK@}"
-            if command -v pw-record &>/dev/null && [[ -n "$def_sink" ]]; then
-                cap_cmd="pw-record --target ${def_sink} --rate 16000 --channels 2 --format s16 -"
+            local snk_target="${def_sink:-@DEFAULT_AUDIO_SINK@}"
+            target_name="Монитор колонок: ${snk_target}"
+            if command -v pw-record &>/dev/null; then
+                cap_cmd="pw-record --target \"${snk_target}\" --rate 16000 --channels 2 --format s16 -"
             elif command -v parec &>/dev/null; then
-                cap_cmd="parec -d ${def_sink}.monitor --rate=16000 --channels=2 --format=s16le"
+                local p_arg=""
+                [[ -n "${def_sink}" ]] && p_arg="-d \"${def_sink}.monitor\""
+                cap_cmd="parec ${p_arg} --rate=16000 --channels=2 --format=s16le"
             elif command -v ffmpeg &>/dev/null; then
                 cap_cmd="ffmpeg -v quiet -f pulse -i default.monitor -f s16le -ac 2 -ar 16000 -"
             fi
@@ -5059,14 +5066,16 @@ run_terminal_vu_meter() {
 
         if [[ -z "${cap_cmd}" ]]; then
             log_danger "Не найдена утилита аудиозахвата (pw-record / parec / ffmpeg)."
+            press_enter
             return 1
         fi
 
         local tone_cmd="speaker-test -t sine -f 1000 -l 1 2>/dev/null || paplay /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null || aplay /usr/share/sounds/alsa/Front_Center.wav 2>/dev/null || true"
 
-        local ret=0
-        python3 - "${target_name}" "${tone_cmd}" < <(${cap_cmd} 2>/dev/null) << 'PYEOF' || ret=$?
-import sys, math, struct, os, time, select, termios, tty
+        read -r -d '' PY_VU_SCRIPT << 'PYEOF' || true
+import sys, math, struct, os, time, select, termios, tty, signal
+if hasattr(signal, 'SIGPIPE'):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 def run():
     target_name = sys.argv[1] if len(sys.argv) > 1 else "Default Output"
@@ -5074,12 +5083,13 @@ def run():
 
     tty_fd = None
     old_attr = None
-    if os.path.exists("/dev/tty"):
+    if os.path.exists("/dev/tty") and sys.stdout.isatty():
         try:
             tty_f = open("/dev/tty", "r")
             tty_fd = tty_f.fileno()
             old_attr = termios.tcgetattr(tty_fd)
             tty.setcbreak(tty_fd)
+            termios.tcflush(tty_fd, termios.TCIFLUSH)
         except Exception:
             tty_fd = None
 
@@ -5112,16 +5122,29 @@ def run():
         return "".join(chars)
 
     try:
-        sys.stderr.write("\033[?25l")
-        sys.stderr.flush()
+        sys.stdout.write("\033[?25l")
+        sys.stdout.flush()
         action = "quit"
+        frames = 0
 
         while True:
+            frames += 1
             if tty_fd is not None:
                 r, _, _ = select.select([tty_fd], [], [], 0)
                 if r:
                     key = os.read(tty_fd, 1).decode("utf-8", "ignore")
-                    if key.lower() in ("q", "\x1b", "\x03"):
+                    if key == "\x1b":
+                        r2, _, _ = select.select([tty_fd], [], [], 0.05)
+                        if r2:
+                            try:
+                                os.read(tty_fd, 32)
+                            except Exception:
+                                pass
+                            continue
+                        else:
+                            action = "quit"
+                            break
+                    elif key.lower() in ("q", "\x03"):
                         action = "quit"
                         break
                     elif key.lower() == "t":
@@ -5130,12 +5153,32 @@ def run():
                     elif key.lower() == "m":
                         action = "toggle"
                         break
+            else:
+                if frames > 10:
+                    action = "quit"
+                    break
 
-            data = sys.stdin.buffer.read(chunk_bytes)
-            if not data or len(data) < chunk_bytes:
-                time.sleep(0.02)
+            buf = bytearray()
+            consecutive_empty = 0
+            while len(buf) < chunk_bytes:
+                needed = chunk_bytes - len(buf)
+                chunk = sys.stdin.buffer.read(needed)
+                if not chunk:
+                    consecutive_empty += 1
+                    if consecutive_empty > 50:
+                        action = "quit"
+                        break
+                    time.sleep(0.01)
+                    continue
+                consecutive_empty = 0
+                buf.extend(chunk)
+
+            if len(buf) < chunk_bytes:
+                if action == "quit":
+                    break
                 continue
 
+            data = bytes(buf)
             count = len(data) // 2
             samples = struct.unpack(f"<{count}h", data)
             left = samples[0::2]
@@ -5183,8 +5226,12 @@ def run():
             out += "  ──────────────────────────────────────────────────────────────────────────────\n"
             out += "  Управление: \033[1m[T]\033[0m Тестовый тон 1кГц  ·  \033[1m[M]\033[0m Сменить Динамики/Микрофон  ·  \033[1m[Q/Esc]\033[0m Выход\n"
 
-            sys.stderr.write(out)
-            sys.stderr.flush()
+            try:
+                sys.stdout.write(out)
+                sys.stdout.flush()
+            except (BrokenPipeError, IOError):
+                action = "quit"
+                break
 
     finally:
         if tty_fd is not None and old_attr is not None:
@@ -5192,8 +5239,11 @@ def run():
                 termios.tcsetattr(tty_fd, termios.TCSADRAIN, old_attr)
             except Exception:
                 pass
-        sys.stderr.write("\033[?25h\033[H\033[2J")
-        sys.stderr.flush()
+        try:
+            sys.stdout.write("\033[?25h\033[H\033[2J")
+            sys.stdout.flush()
+        except (BrokenPipeError, IOError):
+            pass
 
     if action == "toggle":
         sys.exit(42)
@@ -5202,14 +5252,17 @@ def run():
 if __name__ == "__main__":
     run()
 PYEOF
+
+        local ret=0
+        python3 -c "${PY_VU_SCRIPT}" "${target_name}" "${tone_cmd}" < <(eval "${cap_cmd}" 2>/dev/null) || ret=$?
         if (( ret == 42 )); then
             if [[ "${dev_mode}" == "mic" ]]; then dev_mode="monitor"; else dev_mode="mic"; fi
             continue
         fi
         break
     done
-    return 0
 }
+
 
 audio_visualizer_menu() {
     while true; do
