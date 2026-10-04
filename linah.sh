@@ -4469,10 +4469,15 @@ tune_volume_menu() {
         printf "    [%d] ${C_BOLD}%-35s${C_RESET} (Громкость: ${C_CYAN}%s${C_RESET})\n" "${idx}" "${d:0:35}" "${v}"
         ((idx++))
     done
+    printf "    [m] 🎛️  ${C_BOLD}Системные микшеры & Alsamixer${C_RESET} (Pavucontrol, Alsamixer, сохранение ALSA)\n"
     printf "    [0] Назад\n\n"
 
     } > "${MENU_BUF}" 2>&1
-    menu_read pick "Номер устройства: "
+    menu_read pick "Номер устройства: " "tune_volume_pick"
+    if [[ "${pick}" == "m" || "${pick}" == "M" ]]; then
+        system_mixers_menu || true
+        return
+    fi
     if [[ ! "${pick}" =~ ^[0-9]+$ ]] || [[ "${pick}" -lt 1 ]] || [[ "${pick}" -gt ${#sinks_data[@]} ]]; then
         return
     fi
@@ -4501,10 +4506,13 @@ tune_volume_menu() {
     printf "    6) Сделать выходом по умолчанию (Default Sink)\n"
     _hint 'Зачем: назначает устройство основным для новых программ и системных звуков.'
     _hint 'Когда: системные звуки и новые программы играют не туда.'
+    printf "    7) 🎛️  ${C_BOLD}Открыть системные микшеры и Alsamixer${C_RESET}\n"
+    _hint 'Зачем: доступ к аппаратному Alsamixer, Pavucontrol и сохранению настроек ALSA.'
+    _hint 'Когда: нужны физические каналы аудиочипа или сохранение уровней громкости.'
     printf "    0) Отмена\n\n"
 
     } > "${MENU_BUF}" 2>&1
-    menu_read v_act "Твой выбор: "
+    menu_read v_act "Твой выбор: " "tune_volume_action"
     case "${v_act}" in
         1) pactl set-sink-volume "${sel_name}" 100% 2>/dev/null && log_cool "Громкость 100% установлена!" || log_danger "Не удалось установить громкость." ;;
         2) pactl set-sink-volume "${sel_name}" 150% 2>/dev/null && log_cool "Громкость 150% установлена!" || log_danger "Не удалось установить громкость." ;;
@@ -4532,6 +4540,10 @@ tune_volume_menu() {
             else
                 log_danger "Не удалось назначить устройство выходом по умолчанию."
             fi
+            ;;
+        7)
+            system_mixers_menu || true
+            return
             ;;
         *) ;;
     esac
@@ -4854,6 +4866,666 @@ tune_desktop_slider() {
     esac
 
     press_enter
+}
+
+# ==============================================================================
+# 5.1. СИСТЕМНЫЕ МИКШЕРЫ И РЕГУЛЯТОРЫ ГРОМКОСТИ ALSA / PULSE / PIPEWIRE
+# ==============================================================================
+
+launch_gui_tool() {
+    local cmd="$1"
+    local name="$2"
+    if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+        log_warn "Графический дисплей не обнаружен (переменные DISPLAY и WAYLAND_DISPLAY пусты)."
+        printf "  Вы подключены по SSH без проброса X11 (-X) или работаете в чистой консоли TTY.\n"
+        printf "  Для управления звуком в консоли используйте Alsamixer (пункт [1]) или Pulsemixer (пункт [7]).\n\n"
+        press_enter
+        return 1
+    fi
+    log_info "Запуск «${name}» в графической оболочке..."
+    ( eval "${cmd}" &>/dev/null & )
+    disown 2>/dev/null || true
+    log_cool "«${name}» успешно запущен в фоновом режиме!"
+    sleep 0.8
+    return 0
+}
+
+launch_tui_tool() {
+    local cmd="$1"
+    local name="$2"
+    _tty_flush
+    printf "\033[?25h\033[0m" > /dev/tty 2>/dev/null || true
+    clear 2>/dev/null || true
+    eval "${cmd}" || true
+    _tty_flush
+    printf "\033[?25h\033[0m" > /dev/tty 2>/dev/null || true
+    log_cool "Работа с «${name}» завершена."
+    sleep 0.5
+    return 0
+}
+
+run_alsamixer() {
+    if ! command -v alsamixer &>/dev/null; then
+        log_warn "Утилита alsamixer не установлена в системе (пакет alsa-utils)."
+        printf "  Alsamixer — полноэкранный аппаратный регулятор физических чипов и каналов звуковых карт.\n"
+        printf "  Хотите установить alsa-utils прямо сейчас? [Y/n]: "
+        local yn
+        read -r yn
+        if [[ -z "$yn" || "$yn" =~ ^[yYдД] ]]; then
+            log_info "Устанавливаю alsa-utils..."
+            eval "$(_pkg_install_cmd alsa-utils)" || true
+            if ! command -v alsamixer &>/dev/null; then
+                log_danger "Не удалось установить alsa-utils."
+                press_enter
+                return 1
+            fi
+            log_cool "Alsamixer успешно установлен!"
+        else
+            return 0
+        fi
+    fi
+
+    local -a cards_arr=()
+    while read -r c_idx c_name; do
+        [[ -n "$c_idx" ]] && cards_arr+=("${c_idx}:${c_name}")
+    done < <(_alsa_cards)
+
+    local run_cmd="alsamixer"
+    if (( ${#cards_arr[@]} > 1 )); then
+        printf "\n  ${C_BOLD}Обнаружено звуковых карт ALSA: %d${C_RESET}\n" "${#cards_arr[@]}"
+        printf "    [0] Запустить с картой по умолчанию (переключение внутри по клавише F6)\n"
+        local i
+        for (( i=0; i<${#cards_arr[@]}; i++ )); do
+            local ci="${cards_arr[$i]%%:*}"
+            local cn="${cards_arr[$i]##*:}"
+            printf "    [%d] Карта hw:%s (%s)\n" "$((i+1))" "$ci" "$cn"
+        done
+        printf "\n"
+        local c_pick
+        read -r -p "  Выберите карту [0-${#cards_arr[@]}, Enter для 0]: " c_pick
+        if [[ "$c_pick" =~ ^[1-9][0-9]*$ ]] && (( c_pick <= ${#cards_arr[@]} )); then
+            local sel_c="${cards_arr[$((c_pick-1))]%%:*}"
+            run_cmd="alsamixer -c ${sel_c}"
+        fi
+    fi
+
+    launch_tui_tool "${run_cmd}" "Alsamixer"
+}
+
+save_alsa_settings_all() {
+    print_banner
+    log_title "СОХРАНЕНИЕ НАСТРОЕК ALSA ДЛЯ ВСЕХ ПОЛЬЗОВАТЕЛЕЙ (ОБЩЕСИСТЕМНО)"
+    printf "================================================================================\n\n"
+    if ! command -v alsactl &>/dev/null; then
+        log_warn "Утилита alsactl не найдена в системе (пакет alsa-utils)."
+        printf "  Установите alsa-utils: %s\n\n" "$(_pkg_install_cmd alsa-utils)"
+        press_enter
+        return 1
+    fi
+
+    local state_file="/var/lib/alsa/asound.state"
+    [[ ! -f "${state_file}" && -f "/etc/asound.state" ]] && state_file="/etc/asound.state"
+
+    local bkp_dir="${HOME}/.config/linah/backups"
+    mkdir -p "${bkp_dir}"
+    local bkp_file="${bkp_dir}/asound.state.system-backup-$(date +%Y%m%d_%H%M%S)"
+    if [[ -f "${state_file}" ]]; then
+        if sudo cp -a "${state_file}" "${bkp_file}" 2>/dev/null; then
+            sudo chown "${USER}:${USER}" "${bkp_file}" 2>/dev/null || true
+            log_cool "Создан бэкап текущего состояния ALSA:"
+            printf "  📁 %s\n\n" "${bkp_file}"
+        fi
+    fi
+
+    printf "  Фиксирую текущие аппаратные уровни громкости всех аудиочипов ALSA...\n"
+    if sudo alsactl store; then
+        log_cool "Аппаратные настройки ALSA успешно зафиксированы в ${state_file}!"
+
+        if command -v systemctl &>/dev/null; then
+            local srv_enabled=0
+            for srv in alsa-restore.service alsa-state.service; do
+                if systemctl is-enabled "${srv}" &>/dev/null; then
+                    srv_enabled=1
+                    break
+                fi
+            done
+            if (( srv_enabled )); then
+                log_cool "Служба автовосстановления ALSA при загрузке активна."
+            else
+                log_info "Включаю системную службу автовосстановления ALSA при старте..."
+                sudo systemctl enable alsa-restore.service 2>/dev/null || sudo systemctl enable alsa-state.service 2>/dev/null || true
+            fi
+        fi
+
+        printf "\n  ${C_BOLD}Как сделать откат при необходимости:${C_RESET}\n"
+        printf "    1. Воспользоваться пунктом меню «Восстановить настройки ALSA из бэкапа»\n"
+        if [[ -f "${bkp_file}" ]]; then
+            printf "    2. Или вручную командой: ${C_BOLD}sudo alsactl -f %s restore && sudo alsactl store${C_RESET}\n\n" "${bkp_file}"
+        fi
+    else
+        log_danger "Не удалось выполнить команду alsactl store (проверьте права root/sudo)."
+    fi
+
+    press_enter
+}
+
+save_alsa_settings_user() {
+    print_banner
+    log_title "СОХРАНЕНИЕ НАСТРОЕК ALSA ДЛЯ КОНКРЕТНОГО ПОЛЬЗОВАТЕЛЯ"
+    printf "================================================================================\n\n"
+    if ! command -v alsactl &>/dev/null; then
+        log_warn "Утилита alsactl не найдена в системе (пакет alsa-utils)."
+        printf "  Установите alsa-utils: %s\n\n" "$(_pkg_install_cmd alsa-utils)"
+        press_enter
+        return 1
+    fi
+
+    local -a user_list=()
+    user_list+=("${USER}")
+    while IFS=: read -r _ _ s_user _ _; do
+        if [[ -n "$s_user" && "$s_user" != "${USER}" ]]; then
+            local already=0
+            for u in "${user_list[@]}"; do [[ "$u" == "$s_user" ]] && { already=1; break; }; done
+            (( ! already )) && user_list+=("$s_user")
+        fi
+    done < <(get_active_sessions 2>/dev/null || true)
+
+    for h in /home/*; do
+        [[ -d "$h" ]] || continue
+        local u="${h##*/}"
+        local dup=0
+        for ex in "${user_list[@]}"; do
+            [[ "$ex" == "$u" ]] && { dup=1; break; }
+        done
+        (( ! dup )) && user_list+=("$u")
+    done
+
+    printf "  Выберите пользователя, для которого нужно зафиксировать настройки ALSA:\n\n"
+    local i
+    for (( i=0; i<${#user_list[@]}; i++ )); do
+        local u="${user_list[$i]}"
+        local tag=""
+        [[ "$u" == "${USER}" ]] && tag=" ${C_GREEN}[Текущий]${C_RESET}"
+        printf "    [%d] %s%s\n" "$((i+1))" "$u" "$tag"
+    done
+    printf "    [m] Ввести имя пользователя вручную\n"
+    printf "    [0] Отмена\n\n"
+
+    local pick
+    read -r -p "  Твой выбор: " pick
+    local target_user=""
+    if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#user_list[@]} )); then
+        target_user="${user_list[$((pick-1))]}"
+    elif [[ "$pick" == "m" || "$pick" == "M" ]]; then
+        read -r -p "  Введите имя пользователя: " target_user
+    else
+        return 0
+    fi
+
+    [[ -z "$target_user" ]] && return 0
+    local u_home
+    u_home="$(getent passwd "$target_user" 2>/dev/null | cut -d: -f6 || eval echo "~${target_user}")"
+    if [[ -z "$u_home" || ! -d "$u_home" ]]; then
+        log_danger "Домашний каталог пользователя «${target_user}» не найден."
+        press_enter
+        return 1
+    fi
+
+    local u_alsa_dir="${u_home}/.config/alsa"
+    mkdir -p "${u_alsa_dir}" 2>/dev/null || sudo mkdir -p "${u_alsa_dir}"
+    local u_state="${u_alsa_dir}/asound.state"
+
+    if [[ -f "${u_state}" ]]; then
+        local bkp="${u_alsa_dir}/asound.state.user-backup-$(date +%Y%m%d_%H%M%S)"
+        cp -a "${u_state}" "${bkp}" 2>/dev/null || sudo cp -a "${u_state}" "${bkp}"
+        log_info "Создан бэкап предыдущего файла состояния пользователя: ${bkp}"
+    fi
+
+    log_info "Сохранение конфигурации ALSA в ${u_state}..."
+    if alsactl -f "${u_state}" store 2>/dev/null || sudo alsactl -f "${u_state}" store; then
+        if [[ "$(id -un)" != "$target_user" ]]; then
+            sudo chown -R "${target_user}:${target_user}" "${u_alsa_dir}" 2>/dev/null || true
+        fi
+        log_cool "Настройки ALSA пользователя «${target_user}» успешно сохранены!"
+
+        local u_auto_dir="${u_home}/.config/autostart"
+        mkdir -p "${u_auto_dir}" 2>/dev/null || sudo mkdir -p "${u_auto_dir}"
+        local desktop_file="${u_auto_dir}/alsa-user-restore.desktop"
+        cat << AUTOEOF | ( if [[ "$(id -un)" == "$target_user" ]]; then tee "${desktop_file}" >/dev/null; else sudo tee "${desktop_file}" >/dev/null; fi )
+[Desktop Entry]
+Type=Application
+Name=ALSA User State Restore
+Comment=Восстановление персональных уровней громкости ALSA
+Exec=alsactl -f ${u_state} restore
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true
+AUTOEOF
+        if [[ "$(id -un)" != "$target_user" ]]; then
+            sudo chown "${target_user}:${target_user}" "${desktop_file}" 2>/dev/null || true
+        fi
+        log_cool "Сконфигурирован XDG-автозапуск для восстановления настроек при входе пользователя!"
+        printf "  Файл автостарта: %s\n\n" "${desktop_file}"
+        printf "  ${C_BOLD}Как откатить:${C_RESET} удалить файл %s и файл состояния %s\n\n" "${desktop_file}" "${u_state}"
+    else
+        log_danger "Не удалось сохранить настройки ALSA для пользователя ${target_user}."
+    fi
+
+    press_enter
+}
+
+restore_alsa_backup() {
+    print_banner
+    log_title "ВОССТАНОВЛЕНИЕ НАСТРОЕК ALSA ИЗ БЭКАПА"
+    printf "================================================================================\n\n"
+
+    local -a bkps=()
+    local f
+    for f in "${HOME}/.config/linah/backups"/asound.state.* "${HOME}/.config/alsa"/asound.state.*; do
+        [[ -f "$f" ]] && bkps+=("$f")
+    done
+
+    if (( ${#bkps[@]} == 0 )); then
+        log_warn "Резервных копий asound.state не найдено."
+        press_enter
+        return 1
+    fi
+
+    printf "  Найдены следующие резервные копии ALSA:\n\n"
+    local i
+    for (( i=0; i<${#bkps[@]}; i++ )); do
+        local b="${bkps[$i]}"
+        local dt
+        dt="$(stat -c '%y' "$b" 2>/dev/null | cut -d'.' -f1 || true)"
+        printf "    [%d] %s  ${C_DIM}(%s)${C_RESET}\n" "$((i+1))" "${b##*/}" "${dt:-бэкап}"
+        printf "        ${C_GRAY}%s${C_RESET}\n\n" "$b"
+    done
+    printf "    [0] Отмена\n\n"
+
+    local pick
+    read -r -p "  Выберите номер бэкапа для отката: " pick
+    if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#bkps[@]} )); then
+        local sel_bkp="${bkps[$((pick-1))]}"
+        log_info "Восстанавливаю состояние ALSA из ${sel_bkp}..."
+        if sudo alsactl -f "${sel_bkp}" restore; then
+            sudo alsactl store 2>/dev/null || true
+            log_cool "Настройки ALSA успешно восстановлены из резервной копии!"
+        else
+            log_danger "Ошибка при восстановлении состояния ALSA."
+        fi
+    fi
+
+    press_enter
+}
+
+detect_de_mixer() {
+    local de="${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-}}"
+    de="${de,,}"
+    case "${de}" in
+        *kde*|*plasma*)
+            if command -v kcmshell6 &>/dev/null; then echo "kcmshell6 kcm_pulseaudio|Настройки звука KDE Plasma"; return; fi
+            if command -v kcmshell5 &>/dev/null; then echo "kcmshell5 kcm_pulseaudio|Настройки звука KDE Plasma"; return; fi
+            if command -v systemsettings &>/dev/null; then echo "systemsettings kcm_pulseaudio|Настройки звука KDE Plasma"; return; fi
+            ;;
+        *cinnamon*)
+            if command -v cinnamon-settings &>/dev/null; then echo "cinnamon-settings sound|Настройки звука Cinnamon"; return; fi
+            ;;
+        *gnome*|*ubuntu*)
+            if command -v gnome-control-center &>/dev/null; then echo "gnome-control-center sound|Настройки звука GNOME"; return; fi
+            ;;
+        *mate*)
+            if command -v mate-volume-control &>/dev/null; then echo "mate-volume-control|Микшер MATE"; return; fi
+            ;;
+        *xfce*)
+            if command -v xfce4-mixer &>/dev/null; then echo "xfce4-mixer|Микшер XFCE"; return; fi
+            ;;
+    esac
+
+    # Запасной поиск
+    if command -v kcmshell5 &>/dev/null; then echo "kcmshell5 kcm_pulseaudio|Настройки звука KDE Plasma"; return; fi
+    if command -v kcmshell6 &>/dev/null; then echo "kcmshell6 kcm_pulseaudio|Настройки звука KDE Plasma"; return; fi
+    if command -v cinnamon-settings &>/dev/null; then echo "cinnamon-settings sound|Настройки звука Cinnamon"; return; fi
+    if command -v gnome-control-center &>/dev/null; then echo "gnome-control-center sound|Настройки звука GNOME"; return; fi
+    if command -v mate-volume-control &>/dev/null; then echo "mate-volume-control|Микшер MATE"; return; fi
+    if command -v xfce4-mixer &>/dev/null; then echo "xfce4-mixer|Микшер XFCE"; return; fi
+    echo ""
+}
+
+launch_pavucontrol_action() {
+    local cmd="pavucontrol"
+    if ! command -v pavucontrol &>/dev/null; then
+        if command -v pavucontrol-qt &>/dev/null; then
+            cmd="pavucontrol-qt"
+        else
+            log_warn "Pavucontrol не установлен в системе."
+            printf "  Pavucontrol — ключевой визуальный регулятор громкости для PulseAudio и PipeWire.\n"
+            printf "  Хотите установить pavucontrol прямо сейчас? [Y/n]: "
+            local yn
+            read -r yn
+            if [[ -z "$yn" || "$yn" =~ ^[yYдД] ]]; then
+                log_info "Устанавливаю pavucontrol..."
+                eval "$(_pkg_install_cmd pavucontrol)" || true
+                if command -v pavucontrol &>/dev/null; then
+                    log_cool "Pavucontrol успешно установлен!"
+                    cmd="pavucontrol"
+                else
+                    log_danger "Не удалось установить pavucontrol."
+                    press_enter
+                    return 1
+                fi
+            else
+                return 0
+            fi
+        fi
+    fi
+    launch_gui_tool "${cmd}" "Pavucontrol"
+}
+
+launch_de_mixer_action() {
+    local de_info
+    de_info="$(detect_de_mixer)"
+    if [[ -z "$de_info" ]]; then
+        log_warn "Штатный регулятор громкости рабочего стола не обнаружен."
+        printf "  Попробуйте запустить универсальный микшер Pavucontrol (пункт [5]).\n\n"
+        press_enter
+        return 1
+    fi
+    local de_cmd="${de_info%%|*}"
+    local de_name="${de_info##*|}"
+    launch_gui_tool "${de_cmd}" "${de_name}"
+}
+
+launch_stream_mixer_action() {
+    local cmd=""
+    local name=""
+    if command -v pulsemixer &>/dev/null; then
+        cmd="pulsemixer"
+        name="Pulsemixer"
+    elif command -v pamix &>/dev/null; then
+        cmd="pamix"
+        name="Pamix"
+    elif command -v ncpamixer &>/dev/null; then
+        cmd="ncpamixer"
+        name="Ncpamixer"
+    fi
+
+    if [[ -z "$cmd" ]]; then
+        log_warn "Консольный микшер потоков (pulsemixer/pamix/ncpamixer) не найден."
+        printf "  Pulsemixer позволяет удобно регулировать громкость программ прямо в терминале.\n"
+        printf "  Хотите установить pulsemixer прямо сейчас? [Y/n]: "
+        local yn
+        read -r yn
+        if [[ -z "$yn" || "$yn" =~ ^[yYдД] ]]; then
+            log_info "Устанавливаю pulsemixer..."
+            if ! eval "$(_pkg_install_cmd pulsemixer)"; then
+                if command -v pip3 &>/dev/null || command -v pip &>/dev/null; then
+                    log_info "Пробую установку pulsemixer через python pip..."
+                    pip3 install --user pulsemixer 2>/dev/null || pip install --user pulsemixer 2>/dev/null || true
+                fi
+            fi
+            if command -v pulsemixer &>/dev/null; then
+                log_cool "Pulsemixer успешно установлен!"
+                cmd="pulsemixer"
+                name="Pulsemixer"
+            else
+                log_danger "Не удалось установить pulsemixer."
+                press_enter
+                return 1
+            fi
+        else
+            return 0
+        fi
+    fi
+    launch_tui_tool "${cmd}" "${name}"
+}
+
+launch_patchbay_action() {
+    local cmd=""
+    local name=""
+    if command -v qpwgraph &>/dev/null; then
+        cmd="qpwgraph"
+        name="Qpwgraph"
+    elif command -v helvum &>/dev/null; then
+        cmd="helvum"
+        name="Helvum"
+    fi
+
+    if [[ -z "$cmd" ]]; then
+        log_warn "Графический патчбей PipeWire (qpwgraph/helvum) не установлен."
+        printf "  Патчбей визуально отображает соединения между программами и аудиоустройствами.\n"
+        printf "  Хотите установить qpwgraph прямо сейчас? [Y/n]: "
+        local yn
+        read -r yn
+        if [[ -z "$yn" || "$yn" =~ ^[yYдД] ]]; then
+            log_info "Устанавливаю qpwgraph..."
+            eval "$(_pkg_install_cmd qpwgraph)" || true
+            if command -v qpwgraph &>/dev/null; then
+                log_cool "Qpwgraph успешно установлен!"
+                cmd="qpwgraph"
+                name="Qpwgraph"
+            else
+                log_danger "Не удалось установить qpwgraph."
+                press_enter
+                return 1
+            fi
+        else
+            return 0
+        fi
+    fi
+    launch_gui_tool "${cmd}" "${name}"
+}
+
+launch_pwtop_action() {
+    if ! command -v pw-top &>/dev/null; then
+        log_warn "Утилита pw-top не найдена в системе."
+        printf "  pw-top — терминальный монитор задержек, квантов и аудиопотоков PipeWire.\n"
+        printf "  Хотите установить пакет pipewire-bin / pipewire-utils? [Y/n]: "
+        local yn
+        read -r yn
+        if [[ -z "$yn" || "$yn" =~ ^[yYдД] ]]; then
+            log_info "Устанавливаю pipewire-bin / pipewire-utils..."
+            eval "$(_pkg_install_cmd pipewire-bin pipewire-utils)" || true
+            if ! command -v pw-top &>/dev/null; then
+                eval "$(_pkg_install_cmd pipewire)" || true
+            fi
+        else
+            return 0
+        fi
+    fi
+
+    if command -v pw-top &>/dev/null; then
+        launch_tui_tool "pw-top" "pw-top"
+    else
+        log_danger "pw-top не найден."
+        press_enter
+    fi
+}
+
+install_audio_mixers_menu() {
+    while true; do
+        print_banner
+        log_title "УСТАНОВКА АУДИОМИКШЕРОВ И ИНСТРУМЕНТОВ"
+        printf "================================================================================\n\n"
+        local pm; pm="$(_pkg_mgr)"
+        printf "  Менеджер пакетов: ${C_CYAN}%s${C_RESET}\n\n" "${pm}"
+
+        local pavu_stat="${C_RED}[НЕ УСТАНОВЛЕН]${C_RESET}"
+        command -v pavucontrol &>/dev/null && pavu_stat="${C_GREEN}[УСТАНОВЛЕН]${C_RESET}"
+
+        local alsa_stat="${C_RED}[НЕ УСТАНОВЛЕН]${C_RESET}"
+        command -v alsamixer &>/dev/null && alsa_stat="${C_GREEN}[УСТАНОВЛЕН]${C_RESET}"
+
+        local pulse_stat="${C_RED}[НЕ УСТАНОВЛЕН]${C_RESET}"
+        command -v pulsemixer &>/dev/null && pulse_stat="${C_GREEN}[УСТАНОВЛЕН]${C_RESET}"
+
+        local qpw_stat="${C_RED}[НЕ УСТАНОВЛЕН]${C_RESET}"
+        command -v qpwgraph &>/dev/null && qpw_stat="${C_GREEN}[УСТАНОВЛЕН]${C_RESET}"
+
+        local helv_stat="${C_RED}[НЕ УСТАНОВЛЕН]${C_RESET}"
+        command -v helvum &>/dev/null && helv_stat="${C_GREEN}[УСТАНОВЛЕН]${C_RESET}"
+
+        local easy_stat="${C_RED}[НЕ УСТАНОВЛЕН]${C_RESET}"
+        command -v easyeffects &>/dev/null && easy_stat="${C_GREEN}[УСТАНОВЛЕН]${C_RESET}"
+
+        printf "  ${C_BOLD}[1]${C_RESET} 🎚️ Pavucontrol %b — стандартный GUI микшер\n" "${pavu_stat}"
+        printf "  ${C_BOLD}[2]${C_RESET} 🎛️ Alsa-utils (Alsamixer) %b — консольный микшер железа\n" "${alsa_stat}"
+        printf "  ${C_BOLD}[3]${C_RESET} 📊 Pulsemixer %b — консольный ncurses-микшер потоков\n" "${pulse_stat}"
+        printf "  ${C_BOLD}[4]${C_RESET} 🕸️ Qpwgraph %b — удобный граф и роутер аудиокабелей PipeWire\n" "${qpw_stat}"
+        printf "  ${C_BOLD}[5]${C_RESET} 🎛️ EasyEffects %b — системный эквалайзер и компрессор\n" "${easy_stat}"
+        printf "  ${C_BOLD}[6]${C_RESET} 📦 Установить весь рекомендуемый набор (pavucontrol + alsa-utils + pulsemixer)\n"
+        printf "  ${C_BOLD}[0]${C_RESET} 🔙 Назад\n\n"
+
+        local p_choice
+        read -r -p "  Выберите пункт: " p_choice
+        case "${p_choice}" in
+            1)
+                log_info "Устанавливаю pavucontrol..."
+                eval "$(_pkg_install_cmd pavucontrol)" || true
+                press_enter
+                ;;
+            2)
+                log_info "Устанавливаю alsa-utils..."
+                eval "$(_pkg_install_cmd alsa-utils)" || true
+                press_enter
+                ;;
+            3)
+                log_info "Устанавливаю pulsemixer..."
+                if ! eval "$(_pkg_install_cmd pulsemixer)"; then
+                    if command -v pip3 &>/dev/null || command -v pip &>/dev/null; then
+                        log_info "Пробую установку pulsemixer через pip..."
+                        pip3 install --user pulsemixer 2>/dev/null || pip install --user pulsemixer 2>/dev/null || true
+                    fi
+                fi
+                press_enter
+                ;;
+            4)
+                log_info "Устанавливаю qpwgraph..."
+                eval "$(_pkg_install_cmd qpwgraph)" || true
+                press_enter
+                ;;
+            5)
+                log_info "Устанавливаю easyeffects..."
+                eval "$(_pkg_install_cmd easyeffects)" || true
+                press_enter
+                ;;
+            6)
+                log_info "Устанавливаю рекомендуемый набор утилит..."
+                eval "$(_pkg_install_cmd pavucontrol alsa-utils pulsemixer)" || true
+                press_enter
+                ;;
+            0|q|Q) return 0 ;;
+            *) ;;
+        esac
+    done
+}
+
+system_mixers_menu() {
+    while true; do
+        local is_alsa="${C_RED}[НЕ УСТАНОВЛЕН]${C_RESET}"
+        command -v alsamixer &>/dev/null && is_alsa="${C_GREEN}[УСТАНОВЛЕН]${C_RESET}"
+
+        local is_pavu="${C_RED}[НЕ УСТАНОВЛЕН]${C_RESET}"
+        if command -v pavucontrol &>/dev/null; then
+            is_pavu="${C_GREEN}[УСТАНОВЛЕН: pavucontrol]${C_RESET}"
+        elif command -v pavucontrol-qt &>/dev/null; then
+            is_pavu="${C_GREEN}[УСТАНОВЛЕН: pavucontrol-qt]${C_RESET}"
+        fi
+
+        local de_info; de_info="$(detect_de_mixer)"
+        local de_stat="${C_GRAY}[НЕ ОПРЕДЕЛЕН]${C_RESET}"
+        local de_label="Штатные настройки звука рабочего стола"
+        if [[ -n "$de_info" ]]; then
+            de_label="${de_info##*|}"
+            de_stat="${C_GREEN}[УСТАНОВЛЕН]${C_RESET}"
+        fi
+
+        local tui_stat="${C_RED}[НЕ УСТАНОВЛЕН]${C_RESET}"
+        if command -v pulsemixer &>/dev/null; then
+            tui_stat="${C_GREEN}[УСТАНОВЛЕН: pulsemixer]${C_RESET}"
+        elif command -v pamix &>/dev/null; then
+            tui_stat="${C_GREEN}[УСТАНОВЛЕН: pamix]${C_RESET}"
+        elif command -v ncpamixer &>/dev/null; then
+            tui_stat="${C_GREEN}[УСТАНОВЛЕН: ncpamixer]${C_RESET}"
+        fi
+
+        local patch_stat="${C_RED}[НЕ УСТАНОВЛЕН]${C_RESET}"
+        if command -v qpwgraph &>/dev/null; then
+            patch_stat="${C_GREEN}[УСТАНОВЛЕН: qpwgraph]${C_RESET}"
+        elif command -v helvum &>/dev/null; then
+            patch_stat="${C_GREEN}[УСТАНОВЛЕН: helvum]${C_RESET}"
+        fi
+
+        local pwtop_stat="${C_RED}[НЕ УСТАНОВЛЕН]${C_RESET}"
+        command -v pw-top &>/dev/null && pwtop_stat="${C_GREEN}[УСТАНОВЛЕН]${C_RESET}"
+
+        local gui_count=0
+        [[ "$is_pavu" == *"УСТАНОВЛЕН"* ]] && gui_count=$(( gui_count + 1 ))
+        [[ "$de_stat" == *"УСТАНОВЛЕН"* ]] && gui_count=$(( gui_count + 1 ))
+        [[ "$patch_stat" == *"УСТАНОВЛЕН"* ]] && gui_count=$(( gui_count + 1 ))
+
+        {
+        print_banner
+        log_title "СИСТЕМНЫЕ МИКШЕРЫ И РЕГУЛЯТОРЫ ГРОМКОСТИ (ALSA / PULSE / PIPEWIRE)"
+        printf "================================================================================\n\n"
+
+        if (( gui_count == 0 )); then
+            printf "  ${C_BG_RED} ВНИМАНИЕ ${C_RESET} ${C_RED}В системе не обнаружен ни один графический регулятор громкости!${C_RESET}\n"
+            printf "  ${C_YELLOW}Рекомендуется установить Pavucontrol (пункт [5] или [10]).${C_RESET}\n\n"
+        fi
+
+        printf "  ${C_BOLD}УПРАВЛЕНИЕ АППАРАТНЫМ СТЕКОМ ALSA:${C_RESET}\n"
+        printf "  ${C_BOLD}[1]${C_RESET} 🎛️  ${C_BOLD}Запустить Alsamixer${C_RESET} %b\n" "${is_alsa}"
+        _hint 'Зачем: консольный регулятор физических чипов звуковой карты, уровней Master, PCM, Headphone, Mic.'
+        _hint 'Когда: подозрение на аппаратный mute звуковой карты или нужно отрегулировать гейн микрофона.'
+        printf "  ${C_BOLD}[2]${C_RESET} 💾 ${C_BOLD}Сохранить настройки ALSA для всех пользователей${C_RESET} ${C_GREEN}[Общесистемно]${C_RESET}\n"
+        _hint 'Зачем: фиксирует текущие аппаратные уровни громкости в /var/lib/alsa/asound.state.'
+        _hint 'Когда: после перезагрузки сбивается громкость ALSA или слетает unmute колонок.'
+        printf "  ${C_BOLD}[3]${C_RESET} 👤 ${C_BOLD}Сохранить настройки ALSA для конкретного пользователя${C_RESET}\n"
+        _hint 'Зачем: сохраняет профиль громкости ALSA в ~/.config/alsa/asound.state с автозагрузкой при входе.'
+        _hint 'Когда: у разных пользователей системы должны быть свои уровни звука.'
+        printf "  ${C_BOLD}[4]${C_RESET} 🔄 ${C_BOLD}Восстановить настройки ALSA из резервной копии${C_RESET}\n"
+        _hint 'Зачем: возвращает ранее сохраненные состояния звуковых карт из бэкапа.'
+        _hint 'Когда: изменения ухудшили звук или нужно откатить предыдущее сохранение.'
+        printf "\n"
+        printf "  ${C_BOLD}СИСТЕМНЫЕ И СТОРОННИЕ РЕГУЛЯТОРЫ ГРОМКОСТИ:${C_RESET}\n"
+        printf "  ${C_BOLD}[5]${C_RESET} 🎚️  ${C_BOLD}Запустить Pavucontrol${C_RESET} %b\n" "${is_pavu}"
+        _hint 'Зачем: главный визуальный микшер Linux: выходы, входы, приложения, конфигурации карт.'
+        _hint 'Когда: стандартный микшер рабочего стола не видит устройство или поток.'
+        printf "  ${C_BOLD}[6]${C_RESET} 🖥️  ${C_BOLD}Запустить %s${C_RESET} %b\n" "${de_label}" "${de_stat}"
+        _hint 'Зачем: открывает штатную панель настроек звука вашего графического окружения.'
+        _hint 'Когда: нужно настроить системные звуки, баланс или стандартный ползунок.'
+        printf "  ${C_BOLD}[7]${C_RESET} 📊 ${C_BOLD}Запустить Pulsemixer / Pamix${C_RESET} %b\n" "${tui_stat}"
+        _hint 'Зачем: удобный консольный микшер аудиопотоков и устройств в псевдографике.'
+        _hint 'Когда: работаете по SSH или без графического окружения.'
+        printf "  ${C_BOLD}[8]${C_RESET} 🕸️  ${C_BOLD}Запустить Qpwgraph / Helvum${C_RESET} %b\n" "${patch_stat}"
+        _hint 'Зачем: визуальный граф соединений PipeWire («аудиокабели» между программами).'
+        _hint 'Когда: нужно перенаправить звук из одной программы в другую или на два выхода сразу.'
+        printf "  ${C_BOLD}[9]${C_RESET} 📈 ${C_BOLD}Запустить pw-top${C_RESET} %b\n" "${pwtop_stat}"
+        _hint 'Зачем: консольный диспетчер задач PipeWire (кванты, частоты, задержки, дропы).'
+        _hint 'Когда: диагностика щелчков, задержек и нагрузок на аудиосервер.'
+        printf "  ${C_BOLD}[10]${C_RESET} 📥 ${C_BOLD}Установка недостающих аудио-микшеров и инструментов${C_RESET}\n"
+        _hint 'Зачем: пакетный менеджер для быстрой установки pavucontrol, alsa-utils, pulsemixer и др.'
+        _hint 'Когда: нужной утилиты нет в системе.'
+        printf "  ${C_BOLD}[0]${C_RESET} 🔙 ${C_BOLD}Назад в главное меню${C_RESET}\n\n"
+
+        } > "${MENU_BUF}" 2>&1
+        local mix_pick
+        menu_read mix_pick "Твой выбор [0-10]: " "system_mixers_menu"
+        case "${mix_pick}" in
+            1) run_alsamixer ;;
+            2) save_alsa_settings_all ;;
+            3) save_alsa_settings_user ;;
+            4) restore_alsa_backup ;;
+            5) launch_pavucontrol_action ;;
+            6) launch_de_mixer_action ;;
+            7) launch_stream_mixer_action ;;
+            8) launch_patchbay_action ;;
+            9) launch_pwtop_action ;;
+            10) install_audio_mixers_menu ;;
+            0|q|Q) return 0 ;;
+            *) ;;
+        esac
+    done
 }
 
 # ==============================================================================
@@ -6456,6 +7128,25 @@ EOF
             audio_first_aid_kit
             exit 0
             ;;
+        --alsamixer)
+            IS_CLI_CALL=1
+            run_alsamixer
+            exit 0
+            ;;
+        --pavucontrol)
+            IS_CLI_CALL=1
+            launch_pavucontrol_action
+            exit 0
+            ;;
+        --alsa-store)
+            IS_CLI_CALL=1
+            save_alsa_settings_all
+            exit 0
+            ;;
+        --mixers|--system-mixers)
+            system_mixers_menu
+            exit 0
+            ;;
         --remote|--pult|--bt-remote)
             IS_CLI_CALL=1
             bt_remote_menu
@@ -6673,7 +7364,11 @@ EOF
             printf "  --stream-monitor       Стриминг аудиовыхода в stdout (для SSH: aplay / mpv loopback)\n"
             printf "  --user <пользователь>  Выполнять действия в контексте сессии указанного пользователя\n"
             printf "  --streams              Список приложений, играющих звук прямо сейчас, и их громкость\n"
-            printf "  --preset [имя]         Применить пресет: gaming (задержка 128), cinema, hifi, revert\n\n"
+            printf "  --preset [имя]         Применить пресет: gaming (задержка 128), cinema, hifi, revert\n"
+            printf "  --mixers               Меню системных микшеров (Alsamixer, Pavucontrol, сохранение ALSA)\n"
+            printf "  --alsamixer            Запустить Alsamixer (аппаратный микшер ALSA в терминале)\n"
+            printf "  --pavucontrol          Запустить Pavucontrol (графический микшер)\n"
+            printf "  --alsa-store           Зафиксировать настройки ALSA для всей системы\n\n"
             printf "  ${C_BOLD}БЭКАП И ОТЧЁТЫ:${C_RESET}\n"
             printf "  --export-config [файл] Сохранить аудио-конфигурацию в архив .tar.gz\n"
             printf "  --import-config <файл> Восстановить конфигурацию из архива с защитным бэкапом\n"
@@ -6839,6 +7534,9 @@ main() {
         printf "  ${C_BOLD}[16]${C_RESET} 🎛️ ${C_BOLD}Микшер приложений${C_RESET}       — кто играет, громкость/mute конкретных программ\n"
         _hint 'Зачем: показывает все активные аудиопотоки, меняет громкость и переносит программы между выходами.'
         _hint 'Когда: видео играет в браузере без звука или нужно сделать игру тише голосового чата.'
+        printf "  ${C_BOLD}[20]${C_RESET} 🎛️ ${C_BOLD}Системные микшеры & ALSA${C_RESET} — Alsamixer, Pavucontrol, сохранение настроек ALSA\n"
+        _hint 'Зачем: запуск Alsamixer, Pavucontrol, штатного микшера и сохранение профилей ALSA.'
+        _hint 'Когда: нужны физические каналы аудиочипа, графический микшер или сбивается громкость ALSA.'
         printf "\n"
         printf "  ${C_DIM}── Анализ сигнала и пресеты ────────────────────────────────────────────${C_RESET}\n"
         printf "  ${C_BOLD}[15]${C_RESET} 📊 ${C_BOLD}Визуализатор звука / VU${C_RESET} — живой детектор сигнала, CAVA, тест колонок\n"
@@ -6867,7 +7565,7 @@ main() {
         printf "  ${C_BOLD}[0]${C_RESET}  🚪 ${C_BOLD}Выход${C_RESET}                 — бывай, пусть музло качает!\n\n"
 
         } > "${MENU_BUF}" 2>&1
-        menu_read choice "Введи номер пункта [0-19]: " "main_menu"
+        menu_read choice "Введи номер пункта [0-20]: " "main_menu"
         case "${choice}" in
             1) run_full_analysis || true ;;
             2) audio_first_aid_kit || true ;;
@@ -6888,6 +7586,7 @@ main() {
             17) audio_presets_menu || true ;;
             18) remote_session_menu || true ;;
             19) backup_export_menu || true ;;
+            20) system_mixers_menu || true ;;
             0|q|Q)
                 printf "\n${C_GREEN}Бывай, бро! Если звук опять заартачится — ты знаешь, где меня найти.${C_RESET}\n\n"
                 exit 0
