@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 #  LINAH — LINux Audio Helper
+#  Создатель: Илья Ульянов | khameleonium
 #  Диагностика и лечение звука в Linux: PipeWire, PulseAudio, ALSA, Bluetooth.
 #
 #  Запуск:   bash linah.sh            интерактивное меню (стрелки, Enter, цифры)
@@ -385,6 +386,7 @@ print_banner() {
 LOGO
     printf "  ${C_BOLD}${C_CYAN}LIN${C_RESET}${C_DIM}ux ${C_RESET}${C_BOLD}${C_CYAN}A${C_RESET}${C_DIM}udio ${C_RESET}${C_BOLD}${C_CYAN}H${C_RESET}${C_DIM}elper${C_RESET}   ${C_DIM}·${C_RESET}   ${C_DIM}версия ${LINAH_VERSION}${C_RESET}\n"
     printf "  ${C_DIM}Диагностика и лечение звука в Linux · PipeWire · PulseAudio · ALSA · Bluetooth${C_RESET}\n"
+    printf "  ${C_DIM}Создатель: ${C_RESET}${C_BOLD}Илья Ульянов${C_RESET} ${C_DIM}| ${C_CYAN}khameleonium${C_RESET}\n"
     printf "  ${C_DIM}──────────────────────────────────────────────────────────────────────────────${C_RESET}\n\n"
 }
 
@@ -6441,6 +6443,7 @@ EOF
             ;;
         -V|--version)
             printf "LINAH %s\n" "${LINAH_VERSION}"
+            printf "Создатель: Илья Ульянов | khameleonium\n"
             exit 0
             ;;
         -a|--analyze|--analyse|--analysis)
@@ -6656,6 +6659,8 @@ EOF
             exit 0
             ;;
         -h|--help)
+            printf "LINAH — LINux Audio Helper v%s\n" "${LINAH_VERSION}"
+            printf "Создатель: Илья Ульянов | khameleonium\n\n"
             printf "Использование: %s [ОПЦИЯ]\n\n" "$0"
             printf "  (без опций)            Запуск интерактивного меню\n\n"
             printf "  ${C_BOLD}ГЛАВНОЕ:${C_RESET}\n"

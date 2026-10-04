@@ -1,5 +1,7 @@
 # LINAH — LINux Audio Helper
 
+> **Создатель:** Илья Ульянов | [khameleonium](https://github.com/khameleonium)
+
 ```
   ██╗     ██╗███╗   ██╗ █████╗ ██╗  ██╗
   ██║     ██║████╗  ██║██╔══██╗██║  ██║
