@@ -108,6 +108,15 @@ _menu_interactive() {
     return 0
 }
 
+# Сброс накопившихся нажатий клавиш в буфере терминала (например, лишний Enter после ввода цифр)
+_tty_flush() {
+    if [[ -r /dev/tty && -w /dev/tty ]]; then
+        while read -t 0 < /dev/tty 2>/dev/null; do
+            IFS= read -rsn1 _ < /dev/tty 2>/dev/null || break
+        done
+    fi
+}
+
 # menu_read <переменная> <приглашение> [id меню для запоминания позиции]
 menu_read() {
     local __var="$1" __prompt="$2" __id="${3:-$2}"
@@ -126,6 +135,8 @@ menu_read() {
         printf -v "${__var}" '%s' "${__ans}"
         return 0
     fi
+
+    _tty_flush
 
     # --- Разбор буфера: строки, их «чистые» версии и найденные пункты ---
     local -a L=() P=() IL=() IK=() IS=() IE=()
@@ -190,6 +201,10 @@ menu_read() {
 
     local sel="${MENU_LAST[${__id}]:-0}"
     (( sel >= cnt )) && sel=0
+    # Если сохранённая позиция указывает на пункт выхода (0 или q), всегда сбрасываем на первый пункт
+    if [[ "${IK[$sel]}" == "0" || "${IK[$sel]}" == "q" || "${IK[$sel]}" == "Q" ]]; then
+        sel=0
+    fi
     local typed="" key seq result="" redraw=1
 
     printf '\033[?25l' > /dev/tty
@@ -201,7 +216,12 @@ menu_read() {
         # --- Отрисовка: окно по высоте терминала, выбранный пункт всегда виден ---
         local rows=24 cols=80 sz
         sz="$(stty size < /dev/tty 2>/dev/null || true)"
-        [[ "${sz}" =~ ^([0-9]+)\ ([0-9]+)$ ]] && { rows="${BASH_REMATCH[1]}"; cols="${BASH_REMATCH[2]}"; }
+        if [[ "${sz}" =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+            (( BASH_REMATCH[1] > 0 )) && rows="${BASH_REMATCH[1]}"
+            (( BASH_REMATCH[2] > 0 )) && cols="${BASH_REMATCH[2]}"
+        fi
+        (( rows < 10 )) && rows=24
+        (( cols < 20 )) && cols=80
         local -a V=()
         local vi
         for (( i = 0; i < n; i++ )); do
@@ -323,8 +343,13 @@ menu_read() {
         printf '\r\033[K%s%s' "${__prompt}" "${typed:-${IK[$sel]}}" > /dev/tty
     done
 
-    MENU_LAST[${__id}]="${sel}"
+    if [[ "${result}" == "0" || "${result}" == "q" || "${result}" == "Q" || "${IK[$sel]}" == "0" || "${IK[$sel]}" == "q" || "${IK[$sel]}" == "Q" ]]; then
+        MENU_LAST[${__id}]=0
+    else
+        MENU_LAST[${__id}]="${sel}"
+    fi
     printf '\033[?25h\r\033[K%s%s\n' "${__prompt}" "${result}" > /dev/tty
+    _tty_flush
     printf -v "${__var}" '%s' "${result}"
     return 0
 }
@@ -5094,6 +5119,7 @@ select_monitoring_device() {
         return 1
     fi
 
+    {
     print_banner
     if [[ "$mode" == "mic" || "$mode" == "source" ]]; then
         log_title "ВЫБОР МИКРОФОНА ДЛЯ МОНИТОРИНГА"
@@ -5121,9 +5147,10 @@ select_monitoring_device() {
         printf "      ${C_GRAY}Узел: %s${C_RESET}\n\n" "$n"
     done
     printf "  ${C_BOLD}[0]${C_RESET} 🔙 Отмена (оставить текущее устройство)\n\n"
+    } > "${MENU_BUF}" 2>&1
 
     local choice
-    menu_read choice "Выберите номер устройства [0-${#names[@]}]: "
+    menu_read choice "Выберите номер устройства [0-${#names[@]}]: " "select_monitoring_device"
     if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && (( choice <= ${#names[@]} )); then
         VU_SELECTED_TARGET="${names[$((choice-1))]}"
         log_cool "Выбрано: ${descs[$((choice-1))]}"
@@ -5145,7 +5172,7 @@ _run_awk_vu_meter() {
         od_cmd="hexdump -v -e '2/2 \"%7d \" \"\n\"'"
     fi
 
-    trap 'printf "\033[?25h\033[0m\n"' INT TERM EXIT
+    trap 'printf "\033[?25h\033[0m\n"; _menu_cleanup' INT TERM
 
     eval "stdbuf -i0 -o0 -e0 ${cap_cmd}" 2>/dev/null | \
     eval "stdbuf -i0 -o0 -e0 ${od_cmd}" 2>/dev/null | \
@@ -5214,6 +5241,9 @@ _run_awk_vu_meter() {
         printf "\033[?25h\033[0m\n";
     }
     ' || true
+
+    trap - INT TERM
+    _tty_flush
 }
 
 run_terminal_vu_meter() {
@@ -5463,7 +5493,15 @@ def run():
     finally:
         if tty_fd is not None and old_attr is not None:
             try:
+                termios.tcflush(tty_fd, termios.TCIFLUSH)
+            except Exception:
+                pass
+            try:
                 termios.tcsetattr(tty_fd, termios.TCSADRAIN, old_attr)
+            except Exception:
+                pass
+            try:
+                termios.tcflush(tty_fd, termios.TCIFLUSH)
             except Exception:
                 pass
         try:
@@ -5484,6 +5522,7 @@ PYEOF
 
         local ret=0
         python3 -c "${PY_VU_SCRIPT}" "${target_name}" "${target_type}" "${target_node}" "${tone_cmd}" < <(eval "${cap_cmd}" 2>/dev/null) || ret=$?
+        _tty_flush
         if (( ret == 42 )); then
             if [[ "${dev_mode}" == "mic" || "${dev_mode}" == "source" ]]; then
                 dev_mode="sink"
@@ -5569,7 +5608,7 @@ audio_visualizer_menu() {
 
         } > "${MENU_BUF}" 2>&1
         local v_pick
-        menu_read v_pick "Твой выбор [0-6]: "
+        menu_read v_pick "Твой выбор [0-6]: " "audio_visualizer_menu"
         case "${v_pick}" in
             1) run_terminal_vu_meter "${cur_mode}" "${target_node}" || true ;;
             2)
@@ -6823,7 +6862,7 @@ main() {
         printf "  ${C_BOLD}[0]${C_RESET}  🚪 ${C_BOLD}Выход${C_RESET}                 — бывай, пусть музло качает!\n\n"
 
         } > "${MENU_BUF}" 2>&1
-        menu_read choice "Введи номер пункта [0-19]: "
+        menu_read choice "Введи номер пункта [0-19]: " "main_menu"
         case "${choice}" in
             1) run_full_analysis || true ;;
             2) audio_first_aid_kit || true ;;
